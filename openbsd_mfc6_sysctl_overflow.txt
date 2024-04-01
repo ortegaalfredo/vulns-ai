@@ -1,0 +1,51 @@
+OpenBSD's IPv6 Multicast Forwarding Cache Sysctl kernel buffer overflow
+-----------------------------------------------------------------------
+
+Title: OpenBSD's IPv6 Multicast Forwarding Cache Sysctl kernel buffer overflow
+Class: Buffer Overflow
+Remotely Exploitable: No
+Locally Exploitable: Yes
+Advisory URL: https://github.com/ortegaalfredo/vulns-ai/openbsd_mfc6_sysctl_overflow.txt
+
+Vulnerability Description:
+--------------------------
+
+The IPV6CTL_MRTMFC sysctl is used to retrieve Multicast forwarding cache information from the kerner.
+
+This sysctl is implemented in the following function at ip6_mroute.c:443
+
+```c
+int
+mrt6_sysctl_mfc(void *oldp, size_t *oldlenp)
+{
+	struct mf6csysctlarg	 msa
+	if (oldp != NULL && *oldlenp > MAXPHYS)
+		return EINVAL;
+	if (oldp != NULL)
+		msa.ms6a_minfos = malloc(*oldlenp, M_TEMP, M_WAITOK | M_ZERO);		
+	.
+	.
+	.
+	for (rtableid = 0; rtableid <= RT_TABLEID_MAX; rtableid++) {
+		rtable_walk(rtableid, AF_INET6, NULL, mrt6_rtwalk_mf6csysctl,
+		    &msa);
+	}
+	    (error = copyout(msa.ms6a_minfos, oldp, msa.ms6a_needed)) != 0) {
+        .
+        .
+        .
+}
+```
+
+The problem lies in the kernel's failure to verify if the length of the user-mode buffer (oldlenp) matches the necessary structure (ms6a_infos). If the allocated buffer size is smaller than 120 bytes, there will be a heap buffer overflow within the kernel during the execution of the mrt6_rtwalk_mf6csysctl() function. This occurs because the function attempts to populate the insufficiently sized ms6a_minfos structure, which results in overwriting the kernel heap control structures. Since a malicious user controls this structure, they might exploit this situation to execute arbitrary code in the kernel's context. This flaw presents a privilege escalation vulnerability since no root privileges are required to invoke this sysctl, enabling non-privileged users to gain kernel execution.
+
+Preconditions
+-------------
+While the vulnerability is caused by a sysctl that any non-privileged user can call, a Multicast Forwarding Cache entry must be present in the system, and this usually requires root privileges.
+
+Systems vulnerable
+------------------
+Introduced at commit 534e21c9f6bf 2017-05-16
+OpenBSD 6.2 to 7.4 are vulnerable
+
+
