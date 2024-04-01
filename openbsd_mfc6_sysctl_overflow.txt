@@ -2,10 +2,12 @@ OpenBSD's IPv6 Multicast Forwarding Cache Sysctl kernel buffer overflow
 -----------------------------------------------------------------------
 
 Title: OpenBSD's IPv6 Multicast Forwarding Cache Sysctl kernel buffer overflow
+Date: 01-04-2024
 Class: Buffer Overflow
 Remotely Exploitable: No
 Locally Exploitable: Yes
-Advisory URL: https://github.com/ortegaalfredo/vulns-ai/openbsd_mfc6_sysctl_overflow.txt
+Advisory URL: https://github.com/ortegaalfredo/vulns-ai/blob/main/openbsd_mfc6_sysctl_overflow.txt
+Proof-of-Concept: https://github.com/ortegaalfredo/vulns-ai/blob/main/openbsd_mfc6_sysctl_overflow.c
 
 Vulnerability Description:
 --------------------------
