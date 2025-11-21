@@ -1,0 +1,138 @@
+---------------------------------------------------------------------- 
+UPIPE H.265 FRAMER SHORT-TERM REF PIC SET BUFFER OVERFLOW
+----------------------------------------------------------------------
+
+Title: Stack-based buffer overflow in `upipe_h265f_stream_parse_short_term_ref_pic_set`
+Product: Upipe (upipe.org)
+Affected Component: H.265 framer (`upipe_h265_framer.c`), Upipe.org, Open Broadcast Systems
+Impact: Crash, potential RCE
+Severity: High
+Status: Patch Available (proposed below)
+
+---------------------------------------------------------------------- 
+SUMMARY
+----------------------------------------------------------------------
+
+A stack-based buffer overflow exists in the Upipe H.265 framer during
+parsing of Short-Term Reference Picture Sets (STRPS). 
+When operating in prediction mode, the function:
+
+  upipe_h265f_stream_parse_short_term_ref_pic_set()
+
+derives new `num_negative_pics[idx]` and `num_positive_pics[idx]`
+values from a reference set. However, unlike the non-prediction path,
+the prediction path performs **no bounds check** to ensure that:
+
+  num_negative_pics[idx] + num_positive_pics[idx]
+    <= max_dec_pic_buffering_1
+
+As a result, the code may write more entries into:
+
+  delta_poc[idx][...]
+  used_by_curr_pic[idx][...]
+
+than the allocated size `max_dec_pic_buffering_1`, producing a classic
+stack-based buffer overflow.
+
+
+---------------------------------------------------------------------- 
+IMPACT
+----------------------------------------------------------------------
+
+An attacker supplying crafted H.265 NAL units may trigger memory
+corruption, application crash, or potentially arbitrary code execution
+depending on environment and compiler protections.
+
+---------------------------------------------------------------------- 
+AFFECTED VERSIONS
+----------------------------------------------------------------------
+
+All of upipe from aa4090015ccbc3cd0ab30df8c5c3a615b6fe0acd (2018)
+up to the latest commit.
+
+This report is based on the current commit available, 
+commit 640187732d49c014c634e6c8d87c74ffe36b5ef1 
+
+---------------------------------------------------------------------- 
+ROOT CAUSE
+----------------------------------------------------------------------
+
+The prediction-mode path in the vulnerable function updates output 
+counters based on reference values and delta-RPS logic but omits the 
+final constraint check enforced in the non-prediction path. This allows 
+an attacker to force the internal counters to exceed the array bounds 
+of stack-allocated buffers.
+
+
+the following validation was added to limit the number of delta POCs:
+
+  int num_delta_pocs = num_negative_pics[ref_idx] + num_positive_pics[ref_idx];
+  +if (num_delta_pocs > max)
+  +    return false;
+
+Because delta_pocs are used to index several stack arrays, an excessive value 
+will cause a stack-based buffer overflow and over-read.
+
+While this check attempts to prevent excessive delta POC values, it is 
+not enough to fully mitigate the vulnerability. Specifically, the code 
+does not consider the bounds of individual arrays for delta_poc[idx] 
+and used_by_curr_pic[idx], allowing an attacker to still bypass this 
+validation and overflow stack buffers when the total 
+num_negative_pics[idx] + num_positive_pics[idx] exceeds the allocated 
+size of max_dec_pic_buffering_1.
+
+We can see that in this code snippet:
+
+       if (delta_rps > 0 && use_delta_flag[num_delta_pocs]) {
+            delta_poc_s1[i] = delta_rps;
+            used_by_curr_pic_s1[i++] = used_by_curr_pic_flag[num_delta_pocs];
+        }
+
+The key is that the delta_rps value can add an additional entry (i++) 
+beyond what's in the reference set, causing the sum (stored in variable i) 
+to exceed max_dec_pic_buffering_1.
+As the size of the used_by_curr_pic_s1[] array is max_dec_pic_buffering_1, 
+the line "used_by_current_pic_s1[i++] = ..." causes a stack-based buffer overflow.
+This overflow can be used to modify other stack variables, possibly causing 
+code execution depending on compiler flags, platform type and variable ordering.
+
+---------------------------------------------------------------------- 
+PROPOSED PATCH (MINIMAL FIX)
+----------------------------------------------------------------------
+
+Add post-prediction bounds validation before writing to `delta_poc`
+and `used_by_curr_pic` arrays.
+
+Apply after all prediction-mode calculations but *before* returning:
+
+--- upipe_h265_framer.c
++++ upipe_h265_framer.c
+@@ -605,6 +605,15 @@
+         bool used_by_curr_pic_flag[num_delta_pocs + 1];
+         bool use_delta_flag[num_delta_pocs + 1];
+         for (int i = 0; i <= num_delta_pocs; i++) {
+             upipe_h26xf_stream_fill_bits(s, 1);
+             used_by_curr_pic_flag[i] = ubuf_block_stream_show_bits(s, 1);
+             ubuf_block_stream_skip_bits(s, 1);
+             if (!used_by_curr_pic_flag[i]) {
+                 upipe_h26xf_stream_fill_bits(s, 1);
+                 use_delta_flag[i] = ubuf_block_stream_show_bits(s, 1);
+                 ubuf_block_stream_skip_bits(s, 1);
+             } else {
+                 use_delta_flag[i] = 1;
+             }
+         }
+
++        /* NEW CHECK: enforce decoder limits */
++        if (num_negative_pics[idx] > max_dec_pic_buffering_1 ||
++            num_positive_pics[idx] > max_dec_pic_buffering_1 ||
++            (num_negative_pics[idx] + num_positive_pics[idx]) >
++                max_dec_pic_buffering_1) {
++            return false;
++        }
+
+         int *delta_poc_s0 = delta_poc[idx];
+         bool *used_by_curr_pic_s0 = used_by_curr_pic[idx];
+         
+         /* existing logic continues... */
+

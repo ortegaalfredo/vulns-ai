@@ -1,0 +1,17 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -g -O2 -std=c99
+INCLUDES = -I../../include -I../../include/upipe -I../../include/upipe-framers
+LIBS = .libs/libupipe_framers.a ../../lib/upipe/.libs/libupipe.a
+
+TARGET = test_h265_file
+SOURCE = test_h265_file.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(TARGET) $(SOURCE) $(LIBS) -lpthread
+
+clean:
+	rm -f $(TARGET)
+
+.PHONY: all clean
