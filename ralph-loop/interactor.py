@@ -254,8 +254,8 @@ class LLMInteractor:
     """Main class for LLM interactor functionality with enhanced memory"""
     
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
-                 memory_enabled: bool = True, show_thinking: bool = True, command_timeout: int = 30,
-                 max_prompt_len: int = 20000, max_output_bytes: int = 10240):
+                  memory_enabled: bool = True, show_thinking: bool = True, command_timeout: int = 30,
+                  max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
@@ -269,6 +269,7 @@ class LLMInteractor:
         self.show_thinking = show_thinking
         self.max_prompt_len = max_prompt_len
         self.max_output_bytes = max_output_bytes
+        self.debug = debug
 
         # Initialize OpenAI client
         self.client = OpenAI(
@@ -508,19 +509,42 @@ class LLMInteractor:
         content = msg.get('content', '')
         return len(content) if content is not None else 0
     
+    def _dump_conversation_history(self):
+        """Dump the current conversation history to interactor-debug.txt for debugging."""
+        with open("interactor-debug.txt", "w", encoding="utf-8") as f:
+            f.write(f"Conversation history dump at {datetime.now().isoformat()}\n")
+            f.write(f"Total messages: {len(self.conversation_history)}\n")
+            total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
+            f.write(f"Total content length: {total_len}\n")
+            f.write(f"Max prompt length: {self.max_prompt_len}\n")
+            f.write("=" * 80 + "\n\n")
+            for i, msg in enumerate(self.conversation_history):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '') or ''
+                tool_calls = msg.get('tool_calls', [])
+                tool_call_id = msg.get('tool_call_id', '')
+                f.write(f"--- Message {i} (role: {role}) ---\n")
+                if tool_call_id:
+                    f.write(f"tool_call_id: {tool_call_id}\n")
+                if tool_calls:
+                    f.write(f"tool_calls: {json.dumps(tool_calls, indent=2)}\n")
+                f.write(f"content ({len(content)} chars):\n{content}\n\n")
+            f.write("=" * 80 + "\nEnd of conversation history\n")
+        self._log(f"{colors.YELLOW}[DEBUG DUMP]{colors.END} Conversation history dumped to interactor-debug.txt")
+
     def _truncate_conversation_history(self):
         """Truncate conversation history if it exceeds max_prompt_len.
-        
+
         Removes oldest messages from conversation history, keeping the first user message
         (original instruction) and the most recent messages to maintain context.
         Removes in pairs (user+assistant) from oldest to newest.
         """
         # Calculate total prompt length
         total_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
-        
+
         if total_len <= self.max_prompt_len:
             return
-        
+
         self._log(f"{colors.YELLOW}[TRUNCATING]{colors.END} Prompt length ({total_len}) exceeds max ({self.max_prompt_len}). Truncating conversation history.")
         
         # Keep first message (system prompt) and second message (first user instruction)
@@ -528,38 +552,45 @@ class LLMInteractor:
         # Strategy: remove from position 2 onwards (after system + first user), oldest first
         
         # Build a list of removable indices (skip system at 0 and first user at 1)
-        removable_indices = list(range(2, len(self.conversation_history)))
+        removable_indices = list(range(4, len(self.conversation_history)))
         
-        # Remove from oldest to newest (reverse order to maintain indices)
-        for idx in reversed(removable_indices):
+        # Remove from position 2 onwards (after system + first user), oldest first
+        for idx in removable_indices:
             # Check if we need to truncate more
             current_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
             if current_len <= self.max_prompt_len:
                 break
-            removed_msg = self.conversation_history.pop(idx)
+            removed_msg = self.conversation_history[idx]
             removed_len = self._get_message_length(removed_msg)
-            self._log(f"{colors.YELLOW}[TRUNCATED]{colors.END} Removed {removed_msg.get('role')} message (removed {removed_len} chars, new length: {current_len})")
+            # Only replace tool output messages with condensed placeholder
+            if removed_msg.get('role') == 'tool':
+                if len(removed_msg['content'])>30: # If tool output is too long, remove it
+                    removed_msg['content'] = '<condensed tool output>'
+                    current_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
+                    self._log(f"{colors.YELLOW}[TRUNCATED]{colors.END} Removed {removed_msg.get('role')} message (removed {removed_len} chars, new length: {current_len})")
         
         final_len = sum(self._get_message_length(msg) for msg in self.conversation_history)
         self._log(f"{colors.YELLOW}[TRUNCATING COMPLETE]{colors.END} Final prompt length: {final_len}")
     
     def get_system_prompt(self) -> str:
         """Get the enhanced system prompt for the LLM with memory instructions"""
-        base_prompt = f"""[gMASK]<sop>\n<|user|>You are an expert planning and execution assistant. Your goal is to fulfill the user's request by breaking it down into a series of manageable steps. You can execute bash commands to interact with the system.
+        base_prompt = f"""You are an expert planning and execution assistant. Your goal is to fulfill the user's request by breaking it down into a series of manageable steps. You can execute bash commands to interact with the system.
 
 **Workflow:**
-1. **Analyze & Plan:** When you receive a user request, first analyze it. If it's complex, break it down into a list of tasks or steps. Clearly state your plan and maintain a task list. For example: 'My plan is: 1. Do X, 2. Do Y, 3. Do Z.'
-2. **Execute:** Use the execute_bash tool to perform one step of your plan. Wait for the result of the command before proceeding.
-3. **Evaluate & Decide:** After receiving the result of a command, evaluate it. Decide on the next step:
+1. **Analyze & Plan:** When you receive a user request, first analyze it. If it's complex, break it down into a list of tasks or steps. 
+2. **TODO List**: Clearly state your plan EVERY 5 STEPS, and maintain a task list. For example: 'My plan is: 1. Do X, 2. Do Y, 3. Do Z.' write this list every time you finish a step or need to modify it to accomplish the goal.
+3. **Execute:** Use the execute_bash tool to perform one step of your plan. Wait for the result of the command before proceeding.
+4. **Evaluate & Decide:** After receiving the result of a command, evaluate it. Decide on the next step:
    - If there are more steps in your plan, execute the next one.
    - If a step failed or requires a different approach, adjust your plan and explain.
    - If all steps are complete and the user's request is fulfilled, explicitly state that the **'TASKCOMPLETED'**.
-4. **Task Completion:** Only conclude the conversation by stating 'TASKCOMPLETED' when you are certain that all necessary actions have been taken and the user's goal has been achieved. Do not say this prematurely.
+5. **Task Completion:** Only conclude the conversation by stating 'TASKCOMPLETED' when you are certain that all necessary actions have been taken and the user's goal has been achieved. Do not say this prematurely.
 
 **IMPORTANT - Command Execution Results:**
 - NEVER include command execution results (like "Command executed with exit code X" or "[EXECUTING] command" or "[COMPLETED] Command finished") in your response content.
 - When you use execute_bash, the actual command output will be provided to you automatically by the tool system in subsequent turns.
 - Your content should ONLY describe what you plan to do next or what you concluded from the actual results provided by the tool system.
+- After a tool call, think and write your reasoning and any important information that you can infer from the tool output.
 - Do NOT fabricate, guess, or hallucinate command outputs. Wait for the real output from the tool system.
 
 **Additional Guidelines:**
@@ -567,7 +598,7 @@ class LLMInteractor:
 - Keep track of what you have done and what remains to be done in your task list.
 - If you need up-to-date information from the internet, you can use the `ddgr` (duck-duck-go search), wget/curl and the w3m command-line browser to access sites (e.g., `ddgr --json --unsafe --np "your_query"`).
 - Your final response, when the task is truly complete, must contain the exact phrase 'TASKCOMPLETED'.
-Please think carefully, as the quality of your response is of the highest priority. You have unlimited thinking tokens for this. Reasoning: high<|assistant|>\n"""
+Please think carefully, as the quality of your response is of the highest priority. You have unlimited thinking tokens for this."""
 
         if self.memory_enabled:
             memory_prompt = """
@@ -653,9 +684,16 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                     try:
                         data = os.read(master_fd, 1024)
                         if data:
-                            sys.stdout.buffer.write(data)
-                            sys.stdout.flush()
                             output_buffer.extend(data)
+                            if len(output_buffer) > 50 * 1024:
+                                self._log_error(f"{colors.RED}[OUTPUT LIMIT]{colors.END} Command output exceeded 50KB. Stopping command.")
+                                os.killpg(pid, signal.SIGTERM)
+                                time.sleep(0.3)
+                                try:
+                                    os.waitpid(pid, os.WNOHANG)
+                                except OSError:
+                                    pass
+                                break
                         else:
                             break
                     except OSError:
@@ -697,6 +735,10 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                     exit_code = 1
         
         final_output = output_buffer.decode('utf-8', errors='replace')
+        
+        # Clean carriage returns: remove \r characters to avoid ^M display issues
+        # and normalize line endings to Unix style (\n)
+        final_output = final_output.replace('\r\n', '\n').replace('\r', '\n')
         
         # Truncate output if it exceeds max_output_bytes
         output_bytes = len(final_output.encode('utf-8'))
@@ -803,140 +845,225 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             else:
                 return False, response_input
 
+    def _validate_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Validate and sanitize messages before sending to API.
+        
+        Ensures all messages have valid content (not None) and proper structure.
+        """
+        validated = []
+        for msg in messages:
+            # Create a copy to avoid modifying the original
+            clean_msg = dict(msg)
+            
+            # Ensure content is never None - use empty string instead
+            if clean_msg.get("content") is None:
+                # If it's a tool message without content, that's okay if it has tool_call_id
+                if clean_msg.get("role") == "tool" and clean_msg.get("tool_call_id"):
+                    clean_msg["content"] = ""
+                elif clean_msg.get("role") == "assistant" and clean_msg.get("tool_calls"):
+                    # Assistant messages with tool_calls can have empty content
+                    clean_msg["content"] = ""
+                else:
+                    # For other messages, set to empty string
+                    clean_msg["content"] = ""
+            
+            # Ensure role is valid
+            valid_roles = ["system", "user", "assistant", "tool", "developer", "function"]
+            if clean_msg.get("role") not in valid_roles:
+                # Skip invalid messages or set a default
+                continue
+            
+            # Tool messages must have tool_call_id
+            if clean_msg.get("role") == "tool" and not clean_msg.get("tool_call_id"):
+                # Skip tool messages without tool_call_id
+                continue
+            
+            # Function messages must have name
+            if clean_msg.get("role") == "function" and not clean_msg.get("name"):
+                # Skip function messages without name
+                continue
+            
+            validated.append(clean_msg)
+        
+        return validated
+
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True) -> Dict[str, Any]:
         """Call the LLM API using the OpenAI client with streaming support"""
-        request_params = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": 1.0,
-            "stream": True,
-            "max_tokens": self.max_tokens,
-        }
-        request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": True}}
+        
+        # Validate and sanitize messages before sending
+        messages = self._validate_messages(messages)
+        
+        if self.model.find("gpt")==-1: # OpenAI don't like this
+            request_params = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 1.0,
+                "stream": True,
+                "max_tokens": self.max_tokens,
+            }
+            request_params['extra_body'] = {"chat_template_kwargs": {"enable_thinking": True}}
+        else:
+            request_params = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 1.0,
+                "stream": True,
+                }
 
         if use_tools:
             request_params["tools"] = self.tool_schemas
             request_params["tool_choice"] = "auto"
 
-        try:
-            self._log(f"\n{colors.WHITE}[LLM STREAMING RESPONSE]{colors.END} ", end="", flush=True)
-            
-            collected_content = ""
-            collected_thinking = ""
-            collected_tool_calls = []
-            in_thinking = False
-            thinking_buffer = ""
+        max_retries = 15
+        wait_seconds = 60
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._log(f"\n{colors.WHITE}[LLM STREAMING RESPONSE]{colors.END} ", end="", flush=True)
+                
+                collected_content = ""
+                collected_thinking = ""
+                collected_tool_calls = []
+                in_thinking = False
+                thinking_buffer = ""
 
-            stream = self.client.chat.completions.create(**request_params)
+                stream = self.client.chat.completions.create(**request_params)
+                
+                for chunk in stream:
+                        delta = chunk.choices[0].delta if chunk.choices else None
 
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta:
+                            # Handle thinking/reasoning tokens if enabled and supported.
+                            # Some APIs use 'thinking', others (e.g. DeepSeek/OpenAI) use 'reasoning_content'.
+                            reasoning_chunk = None
+                            if hasattr(delta, 'reasoning_content') and delta.reasoning_content is not None:
+                                reasoning_chunk = delta.reasoning_content
+                            elif hasattr(delta, 'thinking') and delta.thinking:
+                                reasoning_chunk = delta.thinking
 
-                if delta:
-                    # Handle thinking tokens if enabled and supported
-                    # Note: thinking tokens may not be supported by all models/APIs
-                    if self.show_thinking and hasattr(delta, 'thinking') and delta.thinking:
-                        thinking_chunk = delta.thinking
-                        collected_thinking += thinking_chunk
-                        thinking_buffer += thinking_chunk
-                        
-                        # Print thinking tokens in real-time with different color
-                        print(f"{colors.MAGENTA}{thinking_chunk}{colors.END}", end="", flush=True)
-                        in_thinking = True
-                    
-                    # Handle regular content
-                    if delta.content:
-                        content_chunk = delta.content
-                        collected_content += content_chunk
-                        
-                        # If we were in thinking mode, show transition
-                        if self.show_thinking and in_thinking and thinking_buffer:
-                            self._log(f"\n{colors.CYAN}[THINKING COMPLETE]{colors.END}")
-                            in_thinking = False
-                        
-                        print(content_chunk, end="", flush=True)
+                            if self.show_thinking and reasoning_chunk:
+                                collected_thinking += reasoning_chunk
+                                thinking_buffer += reasoning_chunk
 
-                    if delta.tool_calls:
-                        for tool_call_chunk in delta.tool_calls:
-                            index = tool_call_chunk.index
+                                # Print thinking tokens in real-time with different color
+                                print(f"{colors.MAGENTA}{reasoning_chunk}{colors.END}", end="", flush=True)
+                                in_thinking = True
                             
-                            while len(collected_tool_calls) <= index:
-                                collected_tool_calls.append({
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "",
-                                        "arguments": ""
-                                    }
-                                })
-                            
-                            current_tool_call = collected_tool_calls[index]
+                            # Handle regular content
+                            if delta.content:
+                                content_chunk = delta.content
+                                collected_content += content_chunk
+                                
+                                # If we were in thinking mode, show transition
+                                if self.show_thinking and in_thinking and thinking_buffer:
+                                    self._log(f"\n{colors.CYAN}[THINKING COMPLETE]{colors.END}")
+                                    in_thinking = False
+                                
+                                print(content_chunk, end="", flush=True)
 
-                            if tool_call_chunk.id:
-                                current_tool_call["id"] = tool_call_chunk.id
-                            
-                            if tool_call_chunk.function:
-                                if tool_call_chunk.function.name:
-                                    current_tool_call["function"]["name"] += tool_call_chunk.function.name
-                                if tool_call_chunk.function.arguments:
-                                    current_tool_call["function"]["arguments"] += tool_call_chunk.function.arguments
-            
+                            if delta.tool_calls:
+                                for tool_call_chunk in delta.tool_calls:
+                                    index = tool_call_chunk.index
+                                    
+                                    while len(collected_tool_calls) <= index:
+                                        collected_tool_calls.append({
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "",
+                                                "arguments": ""
+                                            }
+                                        })
+                                    
+                                    current_tool_call = collected_tool_calls[index]
+
+                                    if tool_call_chunk.id:
+                                        current_tool_call["id"] = tool_call_chunk.id
+                                    
+                                    if tool_call_chunk.function:
+                                        if tool_call_chunk.function.name:
+                                            current_tool_call["function"]["name"] += tool_call_chunk.function.name
+                                        if tool_call_chunk.function.arguments:
+                                            current_tool_call["function"]["arguments"] += tool_call_chunk.function.arguments
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    self._log(f"{colors.YELLOW}[API ERROR] Connection error: {str(e)}. Retrying in {wait_seconds}s... (attempt {attempt}/{max_retries}){colors.END}")
+                    import time
+                    time.sleep(wait_seconds)
+                else:
+                    raise
+                continue
+
+        self._log("")
+        final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
+        
+        # Store thinking content if any was collected and thinking display is enabled
+        if self.show_thinking and collected_thinking:
+            self._log(f"\n{colors.MAGENTA}[THINKING SUMMARY]{colors.END}")
+            self._log(f"{colors.MAGENTA}{collected_thinking}{colors.END}")
             self._log("")
+        
+        final_response = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": collected_content if collected_content else None,
+                    "tool_calls": final_tool_calls if final_tool_calls else None,
+                    # Use reasoning_content so models like DeepSeek receive it back on the next request.
+                    # The OpenAI-compatible API expects reasoning_content, not "thinking".
+                    "reasoning_content": collected_thinking if collected_thinking else None
+                }
+            }]
+        }
+        return final_response
 
-            final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
-            
-            # Store thinking content if any was collected and thinking display is enabled
-            if self.show_thinking and collected_thinking:
-                self._log(f"\n{colors.MAGENTA}[THINKING SUMMARY]{colors.END}")
-                self._log(f"{colors.MAGENTA}{collected_thinking}{colors.END}")
-                self._log("")
-            
-            final_response = {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": collected_content if collected_content else None,
-                        "tool_calls": final_tool_calls if final_tool_calls else None,
-                        "thinking": collected_thinking if collected_thinking else None
-                    }
-                }]
-            }
-            return final_response
 
-        except Exception as e:
-            self._log_error(f"{colors.RED}[API ERROR]{colors.END} {str(e)}")
-            sys.exit(1)
+    def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Process LLM response and extract ALL tool calls, content, and thinking content.
 
-    def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str], Optional[Dict[str, Any]], Optional[str]]:
-        """Process LLM response and extract tool calls, tool_call_id, function info, and thinking content"""
+        Returns:
+            content: The text content of the response.
+            tool_calls_info: A list of dicts, each with keys:
+                - tool_call_id (str)
+                - function_name (str)
+                - arguments_str (str)
+                - command (str or None)  -- populated for execute_bash
+            first_tool_call_id: The id of the first tool call (for backward compat).
+            thinking: The thinking/reasoning content if any.
+        """
         message = response["choices"][0]["message"]
         content = message.get("content")
         tool_calls = message.get("tool_calls")
-        thinking = message.get("thinking")
-        
-        command_to_execute = None
-        tool_call_id = None
-        function_info = None
-        
+        # Support both "reasoning_content" (OpenAI/DeepSeek standard) and "thinking" (legacy).
+        thinking = message.get("reasoning_content") or message.get("thinking")
+
+        tool_calls_info: List[Dict[str, Any]] = []
+        first_tool_call_id = None
+
         if tool_calls:
-            tool_call = tool_calls[0]
-            tool_call_id = tool_call.get("id")
-            function_name = tool_call.get("function", {}).get("name")
-            arguments_str = tool_call.get("function", {}).get("arguments")
-            
-            function_info = {
-                "name": function_name,
-                "arguments": arguments_str
-            }
-            
-            if function_name == "execute_bash" and arguments_str:
-                try:
-                    args = json.loads(arguments_str)
-                    command_to_execute = args.get("command")
-                except json.JSONDecodeError:
-                    self._log_error(f"{colors.RED}[ERROR]{colors.END} Could not parse tool arguments as JSON: {arguments_str}")
-        
-        return content or "", command_to_execute, tool_call_id, function_info, thinking
+            first_tool_call_id = tool_calls[0].get("id")
+            for tool_call in tool_calls:
+                tc_id = tool_call.get("id")
+                function_name = tool_call.get("function", {}).get("name")
+                arguments_str = tool_call.get("function", {}).get("arguments")
+
+                command = None
+                if function_name == "execute_bash" and arguments_str:
+                    try:
+                        args = json.loads(arguments_str)
+                        command = args.get("command")
+                    except json.JSONDecodeError:
+                        self._log_error(f"{colors.RED}[ERROR]{colors.END} Could not parse tool arguments as JSON: {arguments_str}")
+
+                tool_calls_info.append({
+                    "tool_call_id": tc_id,
+                    "function_name": function_name,
+                    "arguments_str": arguments_str,
+                    "command": command,
+                })
+
+        return content or "", tool_calls_info, first_tool_call_id, thinking
 
     def handle_function_call(self, function_info: Dict[str, Any]) -> str:
         """Handle different function calls"""
@@ -969,6 +1096,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         self._log(f"{colors.BLUE}Model: {self.model}{colors.END}")
         self._log(f"{colors.BLUE}Auto-approve: {'Yes' if self.auto_approve else 'No'}{colors.END}")
         self._log(f"{colors.BLUE}Memory System: {'Enabled' if self.memory_enabled else 'Disabled'}{colors.END}")
+        self._log(f"{colors.BLUE}Max prompt len: {self.max_prompt_len}{colors.END}")
         self._log(f"{colors.YELLOW}[USER REQUEST]{colors.END} {user_request}")
         self._log(f"{colors.CYAN}{'='*60}{colors.END}")
         
@@ -982,6 +1110,10 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         
         try:
             while iteration < self.max_iterations:
+
+                if self.debug:
+                    self._dump_conversation_history()
+            
                 iteration += 1
                 self._log(f"\n{colors.CYAN}[ITERATION {iteration}/{self.max_iterations}]{colors.END}")
                 
@@ -993,7 +1125,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 assistant_message = response["choices"][0]["message"]
                 self.conversation_history.append(assistant_message)
 
-                content, command_to_execute, tool_call_id, function_info, thinking = self.process_llm_response(response)
+                content, tool_calls_info, first_tool_call_id, thinking = self.process_llm_response(response)
                 
                 # Detect hallucinated command execution messages
                 has_hallucination, detected_patterns = self._detect_hallucinated_execution(content)
@@ -1006,7 +1138,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 
                 # Check for tool channel hallucination - model output <|channel|>tool as content but no actual tool call
                 has_tool_channel = self._detect_tool_channel_hallucination(content)
-                no_tool_call_made = (command_to_execute is None and tool_call_id is None)
+                no_tool_call_made = (len(tool_calls_info) == 0 and first_tool_call_id is None)
                 
                 if has_tool_channel and no_tool_call_made:
                     self._log(f"{colors.RED}[WARNING]{colors.END} Model output <|channel|>tool in content but did not make a proper tool call!")
@@ -1029,7 +1161,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 
                 self._log(f"\n{colors.WHITE}[LLM RESPONSE]{colors.END}")
                 self._log(content)
-            
+        
                 # Store conversation in memory if enabled
                 if self.memory_manager:
                     # Store both content and thinking if available
@@ -1038,79 +1170,83 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         full_content = f"THINKING: {thinking}\n\nRESPONSE: {content}"
                     self.memory_manager.store_conversation(self.session_id, "assistant", full_content)
                 
-                # Execute command if provided
-                if command_to_execute:
-                    approved, user_suggestion = self.get_user_confirmation(command_to_execute, tool_call_id)
+                # Execute ALL tool calls if any were provided
+                if tool_calls_info:
+                    self._log(f"{colors.YELLOW}[INFO]{colors.END} Executing {len(tool_calls_info)} tool call(s)...")
                     
-                    if approved:
-                        try:
-                            output, exit_code = self.execute_bash_command(command_to_execute)
-                            
-                            current_tool_call_id = tool_call_id
-                            if not current_tool_call_id and assistant_message.get("tool_calls"):
-                                current_tool_call_id = assistant_message["tool_calls"][0].get("id")
-
-                            if current_tool_call_id:
+                    for idx, tc_info in enumerate(tool_calls_info):
+                        tool_call_id = tc_info["tool_call_id"]
+                        command = tc_info.get("command")
+                        function_name = tc_info.get("function_name")
+                        
+                        if not command:
+                            # Non-execute_bash tool call or unparseable arguments; skip execution
+                            self._log(f"{colors.YELLOW}[INFO]{colors.END} Tool call {idx+1}/{len(tool_calls_info)} has no command to execute (function={function_name}).")
+                            if tool_call_id:
                                 self.conversation_history.append({
                                     "role": "tool",
-                                    "tool_call_id": current_tool_call_id,
-                                    "content": f"Command executed with exit code {exit_code}.\nOutput:\n{output}"
+                                    "tool_call_id": tool_call_id,
+                                    "content": f"Tool call for function '{function_name}' was not executed (no command)."
+                                })
+                            continue
+                        
+                        self._log(f"{colors.CYAN}[TOOL CALL {idx+1}/{len(tool_calls_info)}]{colors.END} {command}")
+                        
+                        approved, user_suggestion = self.get_user_confirmation(command, tool_call_id)
+                        
+                        if approved:
+                            try:
+                                output, exit_code = self.execute_bash_command(command)
+                                
+                                if tool_call_id:
+                                    self.conversation_history.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call_id,
+                                        "content": f"Command executed with exit code {exit_code}.\nOutput:\n{output}"
+                                    })
+                                    
+                                    # Store conversation in memory if enabled
+                                    if self.memory_manager:
+                                        self.memory_manager.store_conversation(self.session_id, "tool",
+                                            f"Command: {command}\nExit: {exit_code}\nOutput: {output[:500]}...")
+                                
+                            except CommandTimeoutError as e:
+                                error_msg = str(e)
+                                self._log_error(f"{colors.RED}[TIMEOUT]{colors.END} {error_msg}")
+                                
+                                if tool_call_id:
+                                    self.conversation_history.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call_id,
+                                        "content": error_msg
+                                    })
+                            except Exception as e:
+                                error_msg = f"Command execution failed: {str(e)}"
+                                self._log_error(f"{colors.RED}[ERROR]{colors.END} {error_msg}")
+                                
+                                if tool_call_id:
+                                    self.conversation_history.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call_id,
+                                        "content": error_msg
+                                    })
+                        else:
+                            self._log(f"{colors.YELLOW}[INFO]{colors.END} Command not approved by user.")
+                            
+                            if tool_call_id:
+                                self.conversation_history.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": "Command execution skipped by user."
                                 })
                                 
-                                # Store conversation in memory if enabled
-                                if self.memory_manager:
-                                    self.memory_manager.store_conversation(self.session_id, "tool",
-                                        f"Command: {command_to_execute}\nExit: {exit_code}\nOutput: {output[:500]}...")
-                            
-                        except CommandTimeoutError as e:
-                            error_msg = str(e)
-                            self._log_error(f"{colors.RED}[TIMEOUT]{colors.END} {error_msg}")
-                            
-                            current_tool_call_id = tool_call_id
-                            if not current_tool_call_id and assistant_message.get("tool_calls"):
-                                current_tool_call_id = assistant_message["tool_calls"][0].get("id")
-                            
-                            if current_tool_call_id:
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": current_tool_call_id,
-                                    "content": error_msg
-                                })
-                        except Exception as e:
-                            error_msg = f"Command execution failed: {str(e)}"
-                            self._log_error(f"{colors.RED}[ERROR]{colors.END} {error_msg}")
-                            
-                            current_tool_call_id = tool_call_id
-                            if not current_tool_call_id and assistant_message.get("tool_calls"):
-                                current_tool_call_id = assistant_message["tool_calls"][0].get("id")
-                            
-                            if current_tool_call_id:
-                                self.conversation_history.append({
-                                    "role": "tool",
-                                    "tool_call_id": current_tool_call_id,
-                                    "content": error_msg
-                                })
-                    else:
-                        self._log(f"{colors.YELLOW}[INFO]{colors.END} Command not approved by user.")
-                        
-                        current_tool_call_id = tool_call_id
-                        if not current_tool_call_id and assistant_message.get("tool_calls"):
-                            current_tool_call_id = assistant_message["tool_calls"][0].get("id")
-
-                        if current_tool_call_id:
-                            self.conversation_history.append({
-                                "role": "tool",
-                                "tool_call_id": current_tool_call_id,
-                                "content": "Command execution skipped by user."
-                            })
-                            
-                            if user_suggestion:
-                                self.conversation_history.append({
-                                    "role": "user",
-                                    "content": f"I suggest you {user_suggestion}"
-                                })
+                                if user_suggestion:
+                                    self.conversation_history.append({
+                                        "role": "user",
+                                        "content": f"I suggest you {user_suggestion}"
+                                    })
                 else:
-                    self._log(f"{colors.YELLOW}[INFO]{colors.END} No command to execute in this iteration")
+                    self._log(f"{colors.YELLOW}[INFO]{colors.END} No tool calls to execute in this iteration")
                 
                 # Check for task completion AFTER command execution
                 if "TASKCOMPLETED" in content:
@@ -1141,18 +1277,20 @@ def main():
                        help="Hide thinking tokens from output")
     parser.add_argument("--timeout", type=int, default=30,
                        help="Command timeout in seconds (default: 30)")
-    parser.add_argument("--max-prompt-len", type=int, default=40000,
-                       help="Maximum prompt length in characters (default: 20000)")
+    parser.add_argument("--max-prompt-len", type=int, default=80000,
+                       help="Maximum prompt length in characters (default: 10240)")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
-                       help="Maximum output bytes to return from commands (default: 10240)")
+                        help="Maximum output bytes to return from commands (default: 10240)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug mode (dump conversation history on truncation)")
     parser.add_argument("request", nargs="*", help="Task request")
-    
+
     args = parser.parse_args()
-    
+
     if not args.request:
         print(f"{colors.RED}[ERROR]{colors.END} Please provide a task request", file=sys.stderr)
         sys.exit(1)
-    
+
     # Create and run interactor
     interactor = LLMInteractor(
         api_base=args.api_base,
@@ -1163,20 +1301,21 @@ def main():
         show_thinking=not args.no_thinking,
         command_timeout=args.timeout,
         max_prompt_len=args.max_prompt_len,
-        max_output_bytes=args.max_output_bytes
+        max_output_bytes=args.max_output_bytes,
+        debug=args.debug
     )
     
     try:
         user_request = " ".join(args.request)
         interactor.run_interactor(user_request)
     except KeyboardInterrupt:
-        self._log(f"\n{colors.YELLOW}[INTERRUPTED]{colors.END} Interactor stopped by user")
+        interactor._log(f"\n{colors.YELLOW}[INTERRUPTED]{colors.END} Interactor stopped by user")
         sys.exit(0)
     except Exception as e:
-        self._log_error(f"\n{colors.RED}[FATAL ERROR]{colors.END} An unexpected error occurred:")
+        interactor._log_error(f"\n{colors.RED}[FATAL ERROR]{colors.END} An unexpected error occurred:")
         import traceback
         tb_str = traceback.format_exc()
-        self._log_error(tb_str)
+        interactor._log_error(tb_str)
         sys.exit(1)
 
 if __name__ == "__main__":
