@@ -4,6 +4,11 @@ Date: 22-04-2026
 Class: Sandbox escape
 Locally Exploitabe: Yes
 
+### Limitations:
+
+a. The proof of concept bypass the unveil() limitation for any symlink inside /usr/share/zoneinfo.
+b. The escape need root access only to create a symlink inside /usr/share/zoneinfo. 
+c. For it to work for any user, the /usr/share/zonenifo directory need to have write-access ('chmod 777 /usr/share/zoneinfo'),or having a symlink already setup.
 
 ### Description
 
@@ -55,12 +60,7 @@ if ((cnp->cn_flags & ISSYMLINK) == 0) {
 ### Impact
 
 **Security Policy Bypass**: Allows a process to read files outside the unveil-restricted directory, potentially accessing sensitive system files like `/etc/passwd`, `/etc/shadow` (if readable), or other protected resources.
-
-### Proof of concept:
-
-a. The proof of concept bypass the unveil() limitation for any symlink inside /usr/share/zoneinfo.
-b. The escape need root access only to create a symlink inside /usr/share/zoneinfo. 
-c. For it to work for any user, the /usr/share/zonenifo directory need to have write-access ('chmod 777 /usr/share/zoneinfo'),or having a symlink already setup.
+Likelyhood is *low* because of the requirements to create a symlink from inside the sandbox.
 
 ### Timeline
 
