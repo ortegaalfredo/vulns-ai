@@ -11,18 +11,15 @@ import json
 import subprocess
 import sys
 import time
-import threading
 from typing import Dict, List, Any, Optional, Tuple
 import signal
 import os
 import pty
 import select
-from datetime import datetime, timedelta
+from datetime import datetime
 from openai import OpenAI
 import sqlite3
-import shutil
 from pathlib import Path
-import re
 
 # Color codes for output
 class colors:
@@ -95,6 +92,8 @@ class MemoryManager:
     
     def store_memory(self, content: str, category: str = "general", importance: int = 1, tags: str = "") -> int:
         """Store a new memory in the database"""
+        # Clamp importance to the schema-defined range (1-5)
+        importance = max(1, min(5, importance))
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
@@ -129,7 +128,7 @@ class MemoryManager:
             conditions.append("category = ?")
             params.append(category)
         
-        if min_importance:
+        if min_importance is not None:
             conditions.append("importance >= ?")
             params.append(min_importance)
         
@@ -411,99 +410,21 @@ class LLMInteractor:
         """Print to stdout"""
         print(message, end=end, flush=flush)
     
-    def _log_plain(self, message: str):
-        """Print plain text to stdout (no color codes)"""
-        print(message)
-    
     def _log_error(self, message: str):
         """Print error to stderr"""
         print(message, file=sys.stderr)
     
-    # Patterns that indicate hallucinated command execution
-    HALLUCINATION_PATTERNS = [
-        r'\[EXECUTING\]',           # [EXECUTING] command
-        r'\[COMPLETED\].*Command',   # [COMPLETED] Command finished
-        r'Command executed with exit code \d+',
-        r'Command finished with exit code \d+',
-        r'\[TIMEOUT\]',              # [TIMEOUT] timeout message
-        r'--- Command Output ---',   # Command Output header
-        r'--- End Output ---',       # End Output header
-        r'\[AUTO-APPROVED\]',        # [AUTO-APPROVED] prefix
-        r'\[ERROR\].*command',       # [ERROR] command error
-    ]
-    
-    # Pattern to detect tool channel tokens in content (model hallucinating tool calls)
-    TOOL_CHANNEL_PATTERN = r'<\|channel\|>tool'
-    
-    def _detect_hallucinated_execution(self, content: str) -> Tuple[bool, List[str]]:
-        """Detect hallucinated command execution messages in content.
-        
-        Returns:
-            Tuple of (has_hallucination, list_of_detected_patterns)
-        """
-        if not content:
-            return False, []
-        
-        detected = []
-        for pattern in self.HALLUCINATION_PATTERNS:
-            if re.search(pattern, content, re.IGNORECASE):
-                detected.append(pattern)
-        
-        return len(detected) > 0, detected
-    
-    def _detect_tool_channel_hallucination(self, content: str) -> bool:
-        """Detect if the model output <|channel|>tool as content instead of proper tool call.
-        
-        Returns:
-            True if tool channel token was detected in content.
-        """
-        if not content:
-            return False
-        return bool(re.search(self.TOOL_CHANNEL_PATTERN, content))
-    
-    def _strip_hallucinated_execution(self, content: str) -> str:
-        """Remove hallucinated command execution messages from content.
-        
-        This cleans up content that incorrectly includes execution results
-        that should only come from actual tool calls.
-        """
-        if not content:
-            return content
-        
-        # Lines to remove (hallucinated execution messages)
-        lines = content.split('\n')
-        cleaned_lines = []
-        skip_until_next_iteration = False
-        
-        for line in lines:
-            # Check if line matches any hallucination pattern
-            is_hallucination = False
-            for pattern in self.HALLUCINATION_PATTERNS:
-                if re.search(pattern, line, re.IGNORECASE):
-                    is_hallucination = True
-                    break
-            
-            if is_hallucination:
-                continue
-            
-            # Also check for lines that are just "Command executed..." etc.
-            stripped = line.strip()
-            if stripped.startswith('Command executed') or \
-               stripped.startswith('Command finished') or \
-               stripped.startswith('output too long'):
-                continue
-            
-            cleaned_lines.append(line)
-        
-        result = '\n'.join(cleaned_lines)
-        
-        # Clean up any remaining artifacts
-        # Remove duplicate empty lines
-        while '\n\n\n' in result:
-            result = result.replace('\n\n\n', '\n\n')
-        
-        return result.strip()
-    
+    # --- Single-source-of-truth constants ---
+    # The task-completion marker.  All logic that needs to detect or emit the
+    # end-of-task signal references THIS constant instead of hard-coding the
+    # string in multiple places.  Change it here and every reference updates.
+    COMPLETION_MARKER = "TASKCOMPLETE"
+
+    # The literal string injected by execute_bash_command() when output is
+    # truncated at max_output_bytes.  Centralised here so the prompt can
+    # reference the exact sentinel the runtime uses.
+    OUTPUT_TRUNCATION_SENTINEL = "output too long: truncated"
+
     def _get_message_length(self, msg: dict) -> int:
         """Get the length of a message content, handling None values."""
         content = msg.get('content', '')
@@ -574,32 +495,66 @@ class LLMInteractor:
     
     def get_system_prompt(self) -> str:
         """Get the enhanced system prompt for the LLM with memory instructions"""
+        marker = self.COMPLETION_MARKER
+        truncation_sentinel = self.OUTPUT_TRUNCATION_SENTINEL
+        timeout_seconds = self.command_timeout
+        output_limit = self.max_output_bytes
+
         base_prompt = f"""You are an expert planning and execution assistant. Your goal is to fulfill the user's request by breaking it down into a series of manageable steps. You can execute bash commands to interact with the system.
 
 **Workflow:**
 1. **Analyze & Plan:** When you receive a user request, first analyze it. If it's complex, break it down into a list of tasks or steps. 
 2. **TODO List**: Clearly state your plan EVERY 5 STEPS, and maintain a task list. For example: 'My plan is: 1. Do X, 2. Do Y, 3. Do Z.' write this list every time you finish a step or need to modify it to accomplish the goal.
-3. **Execute:** Use the execute_bash tool to perform one step of your plan. Wait for the result of the command before proceeding.
-4. **Evaluate & Decide:** After receiving the result of a command, evaluate it. Decide on the next step:
+3. **Execute:** Use the execute_bash tool to perform one step of your plan. Wait for the result of the command before proceeding
+4. **Evaluate & Decide:** After receiving the result of a command, evaluate it. decide on the next step:
    - If there are more steps in your plan, execute the next one.
-   - If a step failed or requires a different approach, adjust your plan and explain.
-   - If all steps are complete and the user's request is fulfilled, explicitly state that the **'TASKCOMPLETED'**.
-5. **Task Completion:** Only conclude the conversation by stating 'TASKCOMPLETED' when you are certain that all necessary actions have been taken and the user's goal has been achieved. Do not say this prematurely.
+   - If a step failed or requires a different approach, adjust your plan and explain
+   - If all steps are complete and the user's request is fulfilled, explicitly state that the **'{marker}'**.
+5. **Task Completion:** Only conclude the conversation by stating '{marker}' when you are certain that all necessary actions have been taken and the user's goal has been achieved. Do not say this prematurely.
+
+**IMPORTANT - COMMAND EXECUTION ENVIRONMENT & LIMITATIONS:**
+You MUST be aware of the following runtime constraints when using execute_bash. Plan accordingly to avoid losing data or wasting iterations:
+
+- **Output Truncation:** Command output is capped at {output_limit} bytes. If a command produces more output than this limit, the output will be cut short and the literal sentinel string `{truncation_sentinel}` will be appended to indicate truncation. This means:
+  - You will NOT see the full output of commands that produce large amounts of data (e.g., recursive directory listings, large file reads, verbose builds).
+  - If you see `{truncation_sentinel}` at the end of tool output, the output was truncated and you are missing data. Do NOT assume the command succeeded fully or failed based on partial output.
+  - To handle truncation safely: pipe output through `head -c N` or `tail -c N` to retrieve specific portions. Use `--no-pager` flags where applicable (e.g., `git --no-pager log`). Redirect large outputs to a file and read them in chunks with `sed -n 'start,end p' /path/to/file`.
+  - Prefer targeted commands (e.g., `grep pattern file`, `wc -l`, `stat file`) over dumping entire directories or files.
+
+- **Command Timeout:** Commands are killed after {timeout_seconds} seconds. Long-running processes (e.g., compilation, network operations, large downloads) may be terminated before completion. For long operations:
+  - Run them in the background with `nohup ... &` and check results later, OR
+  - Break them into smaller steps, OR
+  - Use `timeout` subcommands to set your own lower timeout to detect hangs early.
+
+- **PTY Environment:** Commands execute in a pseudo-terminal (PTY). Some programs behave differently under PTY (e.g., colored output, interactive prompts). Use non-interactive flags (e.g., `-y`, `--no-interactive`) when available.
 
 **IMPORTANT - Command Execution Results:**
 - NEVER include command execution results (like "Command executed with exit code X" or "[EXECUTING] command" or "[COMPLETED] Command finished") in your response content.
 - When you use execute_bash, the actual command output will be provided to you automatically by the tool system in subsequent turns.
 - Your content should ONLY describe what you plan to do next or what you concluded from the actual results provided by the tool system.
-- After a tool call, think and write your reasoning and any important information that you can infer from the tool output.
+- After a tool call, think and write your reasoning and any important information that you can infer from the tool output
 - Do NOT fabricate, guess, or hallucinate command outputs. Wait for the real output from the tool system.
 
 **Additional Guidelines:**
 - Focus on one command at a time.
 - Keep track of what you have done and what remains to be done in your task list.
-- If you need up-to-date information from the internet, you can use the `ddgr` (duck-duck-go search), wget/curl and the w3m command-line browser to access sites (e.g., `ddgr --json --unsafe --np "your_query"`).
-- Your final response, when the task is truly complete, must contain the exact phrase 'TASKCOMPLETED'.
-Please think carefully, as the quality of your response is of the highest priority. You have unlimited thinking tokens for this."""
+- If you need up-to-date information from the internet, you can use the `ddgr` (duck-duck-go search), wget/curl and the w3m command-line browser to access sites (e.g. `ddgr --json --unsafe --np "your_query"`).
 
+**CRITICAL — PERSISTENCE AND CONTINUATION POLICY:**
+You MUST continue working until the task is genuinely complete. Do NOT stop early.
+- If you respond without calling any tools, the system will inject a continuation prompt because the task is not finished. You are REQUIRED to keep making progress by calling tools (execute_bash, store_memory, retrieve_memories, search_memories, etc.) until every part of the task is done.
+- Never produce a "final response" that only summarizes what should be done - instead, DO it. Use the tools to take concrete action.
+- If you encounter an error, troubleshoot it. If a command fails, try alternative approaches. Iterate until the objective is achieved.
+- The ONLY acceptable way to stop is to emit the exact phrase '{marker}' AFTER you have verified that all task objectives are met by actually executing the necessary commands and inspecting their results.
+- If you are unsure whether the task is complete, it is NOT complete - continue working.
+- Partial completion is NOT completion. Every item in your task list must be verified done through actual command execution before you emit '{marker}'.
+- Do NOT ask the user for clarification mid-task unless you have exhausted all possible autonomous approaches.
+- Before emitting '{marker}', verify the outcome of your last actions by running verification commands (e.g., checking file contents, running tests, confirming services are operational).
+
+**ANTI-TRUNCATION SAFETY:**
+When you receive output ending with `{truncation_sentinel}`, the output was cut short. You MUST re-run the command with output redirected to a file and read it in chunks with `sed -n 'start,end p' /path/to/file`, or use `head`/`tail` to get specific portions. Do NOT proceed based on truncated output.
+
+Please think carefully, as the quality of your response is of the highest priority. You have unlimited thinking tokens for this."""
         if self.memory_enabled:
             memory_prompt = """
 
@@ -650,20 +605,34 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         pid, master_fd = pty.fork()
 
         if pid == 0:
+            # Best-effort: start a new process group so os.killpg(pid, ...) targets
+            # the child's group rather than the parent's. In sandboxes that forbid
+            # setsid (EPERM), we fall back to running in the parent's group; the
+            # killpg calls in the parent are guarded by try/except OSError already.
+            try:
+                os.setsid()
+            except OSError:
+                pass
             try:
                 os.execvp("/bin/sh", ["/bin/sh", "-c", command])
             except OSError as e:
                 os.write(2, f"Child process error (os.execvp failed): {e}\n".encode('utf-8'))
                 os._exit(1)
+            # os.execvp only returns on error; this line is unreachable on success
             os._exit(0)
 
         exit_code = -1
+        timed_out = False
         
         master_fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         stdin_fl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
         
         fcntl.fcntl(master_fd, fcntl.F_SETFL, master_fl | os.O_NONBLOCK)
         fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, stdin_fl | os.O_NONBLOCK)
+
+        # Derive the output kill threshold from the configurable max_output_bytes
+        # (5x the limit) instead of a hardcoded 50KB, so the two stay in sync.
+        output_kill_threshold = 5 * self.max_output_bytes
 
         start_time = time.time()
         try:
@@ -676,6 +645,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         os.waitpid(pid, os.WNOHANG)
                     except OSError:
                         pass
+                    timed_out = True
                     break
 
                 rlist, _, _ = select.select([master_fd, sys.stdin.fileno()], [], [], 0.1)
@@ -685,8 +655,8 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         data = os.read(master_fd, 1024)
                         if data:
                             output_buffer.extend(data)
-                            if len(output_buffer) > 50 * 1024:
-                                self._log_error(f"{colors.RED}[OUTPUT LIMIT]{colors.END} Command output exceeded 50KB. Stopping command.")
+                            if len(output_buffer) > output_kill_threshold:
+                                self._log_error(f"{colors.RED}[OUTPUT LIMIT]{colors.END} Command output exceeded {output_kill_threshold} bytes. Stopping command.")
                                 os.killpg(pid, signal.SIGTERM)
                                 time.sleep(0.3)
                                 try:
@@ -720,19 +690,38 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             if master_fd is not None:
                 os.close(master_fd)
 
+            # fcntl was imported successfully at the top of this function; ImportError
+            # cannot occur here, so only catch OSError/AttributeError.
             try:
                 fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, stdin_fl)
-            except (ImportError, OSError, AttributeError):
+            except (OSError, AttributeError):
                 pass
             
             if exit_code == -1:
+                # The main loop exited without observing the child's exit status
+                # (e.g., PTY reached EOF before the status was seen).  Use a
+                # blocking waitpid(pid, 0) so the OS reaps the now-dead child
+                # and returns its TRUE exit status.
+                #
+                # The previous code used WNOHANG, which returns (0, 0) for
+                # "still running".  That is indistinguishable from the
+                # "exited normally, code 0" case, causing a false-positive
+                # "Command still running after timeout" message even for
+                # instant commands like `grep`.  Blocking here is correct
+                # because the child has already exited by now.
                 try:
                     _, status = os.waitpid(pid, 0)
-                    exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else \
-                                 (os.WTERMSIG(status) + 128)
-                except OSError as e:
-                    output_buffer.extend(f"\nError waiting for child process: {e}\n".encode('utf-8'))
-                    exit_code = 1
+                    if os.WIFEXITED(status):
+                        exit_code = os.WEXITSTATUS(status)
+                    elif os.WIFSIGNALED(status):
+                        exit_code = os.WTERMSIG(status) + 128
+                    else:
+                        exit_code = 1
+                except OSError:
+                    # ESRCH: child already reaped.  ECHILD: not our child.
+                    # Nothing to report; do not fabricate a "still running"
+                    # message.
+                    pass
         
         final_output = output_buffer.decode('utf-8', errors='replace')
         
@@ -743,7 +732,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         # Truncate output if it exceeds max_output_bytes
         output_bytes = len(final_output.encode('utf-8'))
         if output_bytes > self.max_output_bytes:
-            final_output = final_output[:self.max_output_bytes] + "\noutput too long: truncated"
+            final_output = final_output[:self.max_output_bytes] + "\n" + self.OUTPUT_TRUNCATION_SENTINEL
         
         # Log command completion with output and exit code
         self._log(f"\n{colors.GREEN}[COMPLETED]{colors.END} Command finished with exit code {exit_code}")
@@ -751,6 +740,11 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             self._log(f"{colors.CYAN}--- Command Output ---{colors.END}")
             self._log(final_output)
             self._log(f"{colors.CYAN}--- End Output ---{colors.END}")
+        
+        # Raise CommandTimeoutError if the command timed out, so the caller's
+        # except CommandTimeoutError handler is reachable.
+        if timed_out:
+            raise CommandTimeoutError(f"Command timed out after {self.command_timeout} seconds")
         
         return final_output, exit_code
 
@@ -827,7 +821,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         else:
             return f"Memory {memory_id} not found."
 
-    def get_user_confirmation(self, command: str, _tool_call_id: Optional[str]) -> Tuple[bool, Optional[str]]:
+    def get_user_confirmation(self, command: str) -> Tuple[bool, Optional[str]]:
         """Get user confirmation for command execution"""
         if self.auto_approve:
             self._log(f"{colors.GREEN}[AUTO-APPROVED]{colors.END} {command}")
@@ -836,7 +830,12 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         while True:
             self._log(f"\n{colors.MAGENTA}[CONFIRMATION REQUIRED]{colors.END}")
             self._log(f"Command to execute: {colors.BOLD}{command}{colors.END}")
-            response_input = input(f"{colors.CYAN}Approve command? (y/n/suggestion): {colors.END}").strip().lower()
+            try:
+                response_input = input(f"{colors.CYAN}Approve command? (y/n/suggestion): {colors.END}").strip().lower()
+            except EOFError:
+                # stdin closed (non-interactive use without --auto-approve); default to reject
+                self._log_error(f"{colors.YELLOW}[INFO]{colors.END} stdin closed; rejecting command by default.")
+                return False, None
             
             if response_input in ['y', 'yes', '']:
                 return True, None
@@ -885,6 +884,29 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             
             validated.append(clean_msg)
         
+        # Safety check: prevent consecutive assistant messages at the end of the list.
+        # Many API providers reject this pattern with errors like:
+        # "Cannot have 2 or more assistant messages at the end of the list."
+        # This can happen when a previous turn ended with an assistant message
+        # (no tool calls) and the caller attempts to send another request.
+        while len(validated) >= 2 and validated[-1].get("role") == "assistant" and validated[-2].get("role") == "assistant":
+            # Remove the older of the two consecutive assistant messages
+            validated.pop(-2)
+        
+        # If the last message is an assistant message (no tool calls), we cannot
+        # proceed - the API would have to produce another assistant message.
+        # Return empty list to signal the caller to stop.
+        if len(validated) >= 1 and validated[-1].get("role") == "assistant":
+            # Check if the last assistant message has tool_calls
+            last_msg = validated[-1]
+            has_tool_calls = bool(last_msg.get("tool_calls"))
+            if not has_tool_calls:
+                # The last message is an assistant message without tool calls.
+                # This is a terminal state - we cannot continue without violating
+                # the API's constraint. Signal the caller by returning an empty list.
+                # The caller should check for empty list and terminate the loop.
+                return []
+        
         return validated
 
     def call_llm_api(self, messages: List[Dict[str, str]], use_tools: bool = True) -> Dict[str, Any]:
@@ -892,6 +914,23 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         
         # Validate and sanitize messages before sending
         messages = self._validate_messages(messages)
+        
+        # Safety check: if _validate_messages returns an empty list, it means
+        # the conversation history ends with an assistant message without tool calls.
+        # This is a terminal state - calling the API would produce consecutive
+        # assistant messages which APIs reject. Return a terminal response.
+        if not messages:
+            self._log(f"\n{colors.YELLOW}[SAFETY STOP]{colors.END} Conversation history validation returned empty - terminal assistant state detected. Ending interaction.")
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": f"I have completed my response. No further actions are needed.\n\n{self.COMPLETION_MARKER}",
+                        "tool_calls": None,
+                        "reasoning_content": None
+                    }
+                }]
+            }
         
         if self.model.find("gpt")==-1: # OpenAI don't like this
             request_params = {
@@ -914,7 +953,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             request_params["tools"] = self.tool_schemas
             request_params["tool_choice"] = "auto"
 
-        max_retries = 15
+        max_retries = 5
         wait_seconds = 60
         
         for attempt in range(1, max_retries + 1):
@@ -989,7 +1028,6 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             except Exception as e:
                 if attempt < max_retries:
                     self._log(f"{colors.YELLOW}[API ERROR] Connection error: {str(e)}. Retrying in {wait_seconds}s... (attempt {attempt}/{max_retries}){colors.END}")
-                    import time
                     time.sleep(wait_seconds)
                 else:
                     raise
@@ -1019,7 +1057,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         return final_response
 
 
-    def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str]]:
+    def process_llm_response(self, response: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Process LLM response and extract ALL tool calls, content, and thinking content.
 
         Returns:
@@ -1031,6 +1069,12 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 - command (str or None)  -- populated for execute_bash
             first_tool_call_id: The id of the first tool call (for backward compat).
             thinking: The thinking/reasoning content if any.
+            malformed_tool_calls: A list of dicts describing tool calls whose
+                arguments could not be parsed as valid JSON. Each dict has:
+                - tool_call_id (str)
+                - function_name (str)
+                - raw_arguments (str)
+                - parse_error (str)
         """
         message = response["choices"][0]["message"]
         content = message.get("content")
@@ -1040,6 +1084,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
         tool_calls_info: List[Dict[str, Any]] = []
         first_tool_call_id = None
+        malformed_tool_calls: List[Dict[str, Any]] = []
 
         if tool_calls:
             first_tool_call_id = tool_calls[0].get("id")
@@ -1049,21 +1094,36 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 arguments_str = tool_call.get("function", {}).get("arguments")
 
                 command = None
-                if function_name == "execute_bash" and arguments_str:
+                parsed_args = None
+                parse_error = None
+
+                if arguments_str:
                     try:
-                        args = json.loads(arguments_str)
-                        command = args.get("command")
-                    except json.JSONDecodeError:
-                        self._log_error(f"{colors.RED}[ERROR]{colors.END} Could not parse tool arguments as JSON: {arguments_str}")
+                        parsed_args = json.loads(arguments_str)
+                    except json.JSONDecodeError as e:
+                        parse_error = str(e)
+                        self._log_error(f"{colors.RED}[ERROR]{colors.END} Tool call arguments could not be parsed as JSON: {parse_error}")
+
+                if parse_error is not None:
+                    malformed_tool_calls.append({
+                        "tool_call_id": tc_id,
+                        "function_name": function_name,
+                        "raw_arguments": arguments_str,
+                        "parse_error": parse_error,
+                    })
+                    continue
+
+                if function_name == "execute_bash" and parsed_args is not None:
+                    command = parsed_args.get("command")
 
                 tool_calls_info.append({
                     "tool_call_id": tc_id,
                     "function_name": function_name,
-                    "arguments_str": arguments_str,
+                    "function_arguments": arguments_str,
                     "command": command,
                 })
 
-        return content or "", tool_calls_info, first_tool_call_id, thinking
+        return content or "", tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls
 
     def handle_function_call(self, function_info: Dict[str, Any]) -> str:
         """Handle different function calls"""
@@ -1076,7 +1136,12 @@ Use memory to build long-term knowledge and provide better, more consistent assi
         try:
             args = json.loads(arguments_str)
         except json.JSONDecodeError as e:
-            return f"Invalid JSON in function arguments: {e}"
+            return (f"ERROR: The JSON arguments provided for function '{function_name}' "
+                    f"could not be parsed. Parse error: {e}. "
+                    f"Please re-issue this tool call with valid, properly formatted JSON "
+                    f"arguments. Ensure all strings use double quotes, no literal newlines "
+                    f"inside strings (use \\n), no trailing commas, and the entire "
+                    f"argument is a single valid JSON object.")
         
         if function_name == "store_memory":
             return self.handle_store_memory(args)
@@ -1122,42 +1187,37 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 
                 response = self.call_llm_api(list(self.conversation_history))
                 
+                # Check if this is a safety-stop response (empty validated messages)
+                if not response.get("choices") or not response.get("choices", [{}])[0].get("message"):
+                    self._log(f"\n{colors.YELLOW}[SAFETY STOP]{colors.END} API call returned no valid response. Ending interaction.")
+                    break
+                
                 assistant_message = response["choices"][0]["message"]
-                self.conversation_history.append(assistant_message)
+                
+                # Check if this is a terminal safety response from _validate_messages
+                _content_raw = assistant_message.get("content") or ""
+                if (_content_raw.strip().endswith(self.COMPLETION_MARKER) and
+                    not assistant_message.get("tool_calls") and
+                    not assistant_message.get("reasoning_content") and
+                    len(_content_raw) < 200):
+                    self._log(f"\n{colors.GREEN}[SAFETY STOP - TERMINAL]{colors.END} Terminal state reached. Ending interaction safely.")
+                    break
+                
+                # Remove reasoning_content from the stored message to avoid
+                # confusing APIs that don't expect it in subsequent requests
+                clean_message = dict(assistant_message)
+                clean_message.pop("reasoning_content", None)
+                
+                # Do NOT append if it would create consecutive assistant messages
+                # (this should not happen due to validation, but double-check)
+                if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
+                    # Replace the previous assistant message instead of adding a new one
+                    self.conversation_history[-1] = clean_message
+                else:
+                    self.conversation_history.append(clean_message)
+                content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls = self.process_llm_response(response)
+                
 
-                content, tool_calls_info, first_tool_call_id, thinking = self.process_llm_response(response)
-                
-                # Detect hallucinated command execution messages
-                has_hallucination, detected_patterns = self._detect_hallucinated_execution(content)
-                if has_hallucination:
-                    self._log(f"{colors.RED}[WARNING]{colors.END} Detected hallucinated execution messages in LLM content:")
-                    for pattern in detected_patterns:
-                        self._log(f"  {colors.RED}  - Pattern: {pattern}{colors.END}")
-                    self._log(f"{colors.YELLOW}  Stripping hallucinated content...{colors.END}")
-                    content = self._strip_hallucinated_execution(content)
-                
-                # Check for tool channel hallucination - model output <|channel|>tool as content but no actual tool call
-                has_tool_channel = self._detect_tool_channel_hallucination(content)
-                no_tool_call_made = (len(tool_calls_info) == 0 and first_tool_call_id is None)
-                
-                if has_tool_channel and no_tool_call_made:
-                    self._log(f"{colors.RED}[WARNING]{colors.END} Model output <|channel|>tool in content but did not make a proper tool call!")
-                    self._log(f"{colors.YELLOW}  Adding correction and retrying...{colors.END}")
-                    
-                    # Remove the last assistant message (it contained hallucinated content)
-                    if self.conversation_history and self.conversation_history[-1].get("role") == "assistant":
-                        self.conversation_history.pop()
-                    
-                    # Add correction message
-                    correction_msg = {
-                        "role": "user",
-                        "content": "IMPORTANT: You output '<|channel|>tool' in your response but did not properly call the execute_bash tool using the function calling format. Please use the execute_bash tool properly by making a tool_call with the correct JSON arguments format. Do NOT output '<|channel|>tool' as text content - it should be sent as a proper tool call."
-                    }
-                    self.conversation_history.append(correction_msg)
-                    
-                    # Log and continue to next iteration to retry
-                    self._log(f"{colors.CYAN}[RETRYING WITH CORRECTION]{colors.END}")
-                    continue
                 
                 self._log(f"\n{colors.WHITE}[LLM RESPONSE]{colors.END}")
                 self._log(content)
@@ -1170,6 +1230,32 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         full_content = f"THINKING: {thinking}\n\nRESPONSE: {content}"
                     self.memory_manager.store_conversation(self.session_id, "assistant", full_content)
                 
+                # Handle malformed tool calls - notify the LLM and request a corrected response
+                if malformed_tool_calls:
+                    self._log(f"{colors.YELLOW}[INFO]{colors.END} {len(malformed_tool_calls)} tool call(s) had malformed JSON arguments. Requesting correction from LLM.")
+                    for mal in malformed_tool_calls:
+                        err_msg = (
+                            f"ERROR: The tool call with id '{mal['tool_call_id']}' (function: '{mal['function_name']}') "
+                            f"contained malformed JSON arguments that could not be parsed.\n\n"
+                            f"Parse error: {mal['parse_error']}\n\n"
+                            f"Your function arguments MUST be a valid JSON object. Ensure:\n"
+                            f"1. All strings are properly quoted with double quotes\n"
+                            f"2. No unescaped newline characters inside strings (use \\n instead of literal newlines)\n"
+                            f"3. No trailing commas\n"
+                            f"4. The entire argument string is a single valid JSON object\n\n"
+                            f"Please re-issue the tool call with corrected, valid JSON arguments. "
+                            f"If you cannot produce valid JSON for this tool call, respond with a normal text message instead."
+                        )
+                        self.conversation_history.append({
+                            "role": "tool",
+                            "tool_call_id": mal["tool_call_id"],
+                            "content": err_msg,
+                        })
+                    self._log(f"{colors.YELLOW}[INFO]{colors.END} Correction messages appended. Continuing to next iteration for LLM to fix the tool calls.")
+                    # Do not proceed with normal tool execution this iteration; let the loop continue
+                    # so the LLM can re-issue corrected tool calls.
+                    continue
+
                 # Execute ALL tool calls if any were provided
                 if tool_calls_info:
                     self._log(f"{colors.YELLOW}[INFO]{colors.END} Executing {len(tool_calls_info)} tool call(s)...")
@@ -1180,19 +1266,20 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         function_name = tc_info.get("function_name")
                         
                         if not command:
-                            # Non-execute_bash tool call or unparseable arguments; skip execution
-                            self._log(f"{colors.YELLOW}[INFO]{colors.END} Tool call {idx+1}/{len(tool_calls_info)} has no command to execute (function={function_name}).")
-                            if tool_call_id:
+                            # Non-execute_bash tool call (memory functions); route to handle_function_call
+                            self._log(f"{colors.YELLOW}[INFO]{colors.END} Tool call {idx+1}/{len(tool_calls_info)} has no command to execute (function={function_name}). Handling memory function call.")
+                            if tool_call_id and function_name:
+                                result = self.handle_function_call({"name": function_name, "arguments": tc_info["function_arguments"]})
                                 self.conversation_history.append({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
-                                    "content": f"Tool call for function '{function_name}' was not executed (no command)."
+                                    "content": result
                                 })
                             continue
                         
                         self._log(f"{colors.CYAN}[TOOL CALL {idx+1}/{len(tool_calls_info)}]{colors.END} {command}")
                         
-                        approved, user_suggestion = self.get_user_confirmation(command, tool_call_id)
+                        approved, user_suggestion = self.get_user_confirmation(command)
                         
                         if approved:
                             try:
@@ -1247,10 +1334,31 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                                     })
                 else:
                     self._log(f"{colors.YELLOW}[INFO]{colors.END} No tool calls to execute in this iteration")
+                    _content_check = content if isinstance(content, str) else ""
+                    
+                    if _content_check.strip().endswith(self.COMPLETION_MARKER) or self.COMPLETION_MARKER in _content_check:
+                        # The assistant has signaled task completion
+                        break
+                    
+                    # The assistant stopped without calling tools and without signaling
+                    # completion.  This is a premature stop - the task is NOT finished.
+                    # Inject a continuation message so the LLM keeps working until done.
+                    self._log(f"{colors.YELLOW}[CONTINUATION]{colors.END} Assistant provided a response without tool calls and without completion signal. Task is not finished. Injecting continuation prompt.")
+                    
+                    continuation_msg = (
+                        f"Continue working on the task. You previously responded without using any tools. "
+                        f"If the task is truly complete, you MUST emit the completion signal \"{self.COMPLETION_MARKER}\" "
+                        f"on its own. Otherwise, continue by using the appropriate tools to make progress. "
+                        f"Do NOT simply describe what needs to be done - take the next concrete step using "
+                        f"execute_bash or other available tools. Remember: you must keep going until the "
+                        f"task is fully finished, then emit \"{self.COMPLETION_MARKER}\"."
+                    )
+                    self.conversation_history.append({"role": "user", "content": continuation_msg})
+                    # Continue the loop - do NOT break
                 
                 # Check for task completion AFTER command execution
-                if "TASKCOMPLETED" in content:
-                    self._log(f"\n{colors.GREEN}[TASK COMPLETED SUCCESSFULLY]{colors.END}")
+                if self.COMPLETION_MARKER in content:
+                    self._log(f"\n{colors.GREEN}[{self.COMPLETION_MARKER} DETECTED - TASK COMPLETED SUCCESSFULLY]{colors.END}")
                     break
                 
                 # Check if we've reached max iterations
@@ -1278,7 +1386,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=30,
                        help="Command timeout in seconds (default: 30)")
     parser.add_argument("--max-prompt-len", type=int, default=80000,
-                       help="Maximum prompt length in characters (default: 10240)")
+                       help="Maximum prompt length in characters (default: 80000)")
     parser.add_argument("--max-output-bytes", type=int, default=10240,
                         help="Maximum output bytes to return from commands (default: 10240)")
     parser.add_argument("--debug", action="store_true",
