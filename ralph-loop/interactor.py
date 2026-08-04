@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Advanced LLM Interactor Tool with Enhanced Memory System
+Advanced LLM Interactor Tool
 A sophisticated command-line tool that provides shell access and task planning
-capabilities to Large Language Models through function calling, with persistent
-memory using SQLite and text file storage.
+capabilities to Large Language Models through function calling.
 
 This version supports two presentation modes:
   --nogui  : Original direct-CLI behaviour (stdout/stderr, no TUI)
@@ -30,8 +29,6 @@ import select
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from openai import OpenAI
-import sqlite3
-from pathlib import Path
 
 try:
     # Textual is only required for TUI mode; --nogui runs without it.
@@ -114,7 +111,7 @@ class EventSink:
             CMD_OUTPUT       – raw command output chunk
             CMD_COMPLETE     – command finished with exit code
             SYSTEM           – system banner (model, API base, config)
-            STATUS_UPDATE    – footer status update (tok/s, iteration, etc.)
+            STATUS_UPDATE    – footer status update (tok/s, step, etc.)
             APPROVAL_REQUEST – command awaiting approval
             SHUTDOWN         – agent is shutting down
         payload fields depend on kind; common keys: text, end, flush.
@@ -212,7 +209,6 @@ class TUISink(EventSink):
     def input(self, prompt: str) -> str:
         # Fast path: auto-approve enabled → no blocking
         if self.auto_approve:
-            self.emit("LOG", {"text": "[AUTO-APPROVED] " + prompt})
             return "y"
 
         # Push an approval request event so the TUI can display it
@@ -252,232 +248,19 @@ class TUISink(EventSink):
             self._approval_event.set()  # unblock any waiting approval
 
 
-class MemoryManager:
-    """Manages persistent memory storage using SQLite and text files"""
-
-    def __init__(self, db_path: str = "llm_memory.db", backup_dir: str = "memory_backups"):
-        self.db_path = db_path
-        self.backup_dir = backup_dir
-        self._initialize_database()
-        self._ensure_backup_directory()
-
-    def _initialize_database(self):
-        """Initialize the SQLite database with required tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Create memories table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                category TEXT DEFAULT 'general',
-                importance INTEGER DEFAULT 1,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                tags TEXT,
-                access_count INTEGER DEFAULT 0,
-                last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # Create conversations table for conversation history
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # Create indexes for better performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)')
-
-        conn.commit()
-        conn.close()
-
-    def _ensure_backup_directory(self):
-        """Ensure backup directory exists"""
-        Path(self.backup_dir).mkdir(exist_ok=True)
-
-    def store_memory(self, content: str, category: str = "general", importance: int = 1, tags: str = "") -> int:
-        """Store a new memory in the database"""
-        # Clamp importance to the schema-defined range (1-5)
-        importance = max(1, min(5, importance))
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            INSERT INTO memories (content, category, importance, tags)
-            VALUES (?, ?, ?, ?)
-        ''', (content, category, importance, tags))
-
-        memory_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-
-        # Create text backup
-        self._backup_memory_to_file(memory_id, content, category, importance, tags)
-
-        return memory_id
-
-    def retrieve_memories(self, limit: int = 10, category: str = None, min_importance: int = 1,
-                          search_query: str = None) -> List[Dict[str, Any]]:
-        """Retrieve memories with optional filtering"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        query = '''
-            SELECT id, content, category, importance, timestamp, tags, access_count
-            FROM memories
-        '''
-        conditions = []
-        params = []
-
-        if category:
-            conditions.append("category = ?")
-            params.append(category)
-
-        if min_importance is not None:
-            conditions.append("importance >= ?")
-            params.append(min_importance)
-
-        if search_query:
-            conditions.append("(content LIKE ? OR tags LIKE ?)")
-            params.extend([f"%{search_query}%", f"%{search_query}%"])
-
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-
-        query += " ORDER BY importance DESC, timestamp DESC LIMIT ?"
-        params.append(limit)
-
-        cursor.execute(query, params)
-        results = cursor.fetchall()
-
-        # Update access count and last accessed time
-        for row in results:
-            memory_id = row[0]
-            cursor.execute('''
-                UPDATE memories
-                SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (memory_id,))
-
-        conn.commit()
-        conn.close()
-
-        # Convert to list of dictionaries
-        memories = []
-        for row in results:
-            memories.append({
-                'id': row[0],
-                'content': row[1],
-                'category': row[2],
-                'importance': row[3],
-                'timestamp': row[4],
-                'tags': row[5],
-                'access_count': row[6]
-            })
-
-        return memories
-
-    def search_memories(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search memories by content or tags"""
-        return self.retrieve_memories(limit=limit, search_query=query)
-
-    def delete_memory(self, memory_id: int) -> bool:
-        """Delete a memory by ID"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('DELETE FROM memories WHERE id = ?', (memory_id,))
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-
-        if deleted:
-            # Remove backup file
-            backup_file = Path(self.backup_dir) / f"memory_{memory_id}.txt"
-            if backup_file.exists():
-                backup_file.unlink()
-
-        return deleted
-
-    def _backup_memory_to_file(self, memory_id: int, content: str, category: str, importance: int, tags: str):
-        """Create a text backup of a memory"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        backup_content = f"""Memory ID: {memory_id}
-Timestamp: {timestamp}
-Category: {category}
-Importance: {importance}
-Tags: {tags}
-Content:
-{content}
-"""
-
-        backup_file = Path(self.backup_dir) / f"memory_{memory_id}.txt"
-        with open(backup_file, 'w', encoding='utf-8') as f:
-            f.write(backup_content)
-
-    def store_conversation(self, session_id: str, role: str, content: str):
-        """Store conversation history"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            INSERT INTO conversations (session_id, role, content)
-            VALUES (?, ?, ?)
-        ''', (session_id, role, content))
-
-        conn.commit()
-        conn.close()
-
-    def get_conversation_history(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Retrieve conversation history for a session"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT role, content, timestamp
-            FROM conversations
-            WHERE session_id = ?
-            ORDER BY timestamp ASC
-            LIMIT ?
-        ''', (session_id, limit))
-
-        results = cursor.fetchall()
-        conn.close()
-
-        history = []
-        for row in results:
-            history.append({
-                'role': row[0],
-                'content': row[1],
-                'timestamp': row[2]
-            })
-
-        return history
-
-
 class LLMInteractor:
-    """Main class for LLM interactor functionality with enhanced memory"""
+    """Main class for LLM interactor functionality"""
 
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
-                  memory_enabled: bool = True, show_thinking: bool = True, command_timeout: int = 30,
+                  show_thinking: bool = True, command_timeout: int = 30,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
                   sink: EventSink = None):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
         self.auto_approve = auto_approve
-        self.memory_enabled = memory_enabled
         self.conversation_history = []
-        self.max_iterations = 500
+        self.max_steps = 500
         self.max_tokens = 8000
         self.command_timeout = command_timeout
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -490,9 +273,15 @@ class LLMInteractor:
         # agent is usable without a TUI (backward-compatible --nogui path).
         self.sink: EventSink = sink if sink is not None else ConsoleSink()
 
-        # Shutdown coordination – checked between iterations and before
+        # Shutdown coordination – checked between steps and before
         # each command execution so the TUI can halt the agent cleanly.
         self.stop_event = threading.Event()
+
+        # Queue for mid-run user suggestions.  The TUI (main thread) pushes
+        # steering messages here while the agent is running; the agent thread
+        # drains the queue at the start of each step and injects them as
+        # user messages so behavior can be steered mid-execution.
+        self.suggestion_queue: queue.Queue = queue.Queue()
 
         # Initialize OpenAI client
         self.client = OpenAI(
@@ -500,13 +289,7 @@ class LLMInteractor:
             base_url=self.base_url
         )
 
-        # Initialize memory manager
-        if memory_enabled:
-            self.memory_manager = MemoryManager()
-        else:
-            self.memory_manager = None
-
-        # Enhanced tool schemas
+        # Tool schemas
         self.tool_schemas = [
             {
                 "type": "function",
@@ -522,109 +305,6 @@ class LLMInteractor:
                             }
                         },
                         "required": ["command"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "store_memory",
-                    "description": "Store important information in persistent memory for future access",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "content": {
-                                "type": "string",
-                                "description": "The content to store in memory"
-                            },
-                            "category": {
-                                "type": "string",
-                                "description": "Category for the memory (e.g., 'project', 'user_preference', 'technical_note', 'learning')",
-                                "enum": ["general", "project", "user_preference", "technical_note", "learning", "configuration", "bug_fix", "algorithm"]
-                            },
-                            "importance": {
-                                "type": "integer",
-                                "description": "Importance level (1-5, where 5 is most important)",
-                                "minimum": 1,
-                                "maximum": 5
-                            },
-                            "tags": {
-                                "type": "string",
-                                "description": "Comma-separated tags for easier searching (optional)"
-                            }
-                        },
-                        "required": ["content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "retrieve_memories",
-                    "description": "Retrieve stored memories with optional filtering",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of memories to retrieve",
-                                "default": 10
-                            },
-                            "category": {
-                                "type": "string",
-                                "description": "Filter by category (optional)",
-                                "enum": ["general", "project", "user_preference", "technical_note", "learning", "configuration", "bug_fix", "algorithm"]
-                            },
-                            "min_importance": {
-                                "type": "integer",
-                                "description": "Filter by minimum importance level (1-5)",
-                                "minimum": 1,
-                                "maximum": 5
-                            },
-                            "search_query": {
-                                "type": "string",
-                                "description": "Search in memory content and tags (optional)"
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "search_memories",
-                    "description": "Search memories by content or tags",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Search query"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of results",
-                                "default": 10
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "delete_memory",
-                    "description": "Delete a memory by ID",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "memory_id": {
-                                "type": "integer",
-                                "description": "The ID of the memory to delete"
-                            }
-                        },
-                        "required": ["memory_id"]
                     }
                 }
             }
@@ -713,7 +393,7 @@ class LLMInteractor:
         self._log(f"[TRUNCATING COMPLETE] Final prompt length: {final_len}")
 
     def get_system_prompt(self) -> str:
-        """Get the enhanced system prompt for the LLM with memory instructions"""
+        """Get the system prompt for the LLM"""
         marker = self.COMPLETION_MARKER
         truncation_sentinel = self.OUTPUT_TRUNCATION_SENTINEL
         timeout_seconds = self.command_timeout
@@ -749,45 +429,10 @@ class LLMInteractor:
 - Before emitting '{marker}', verify your last actions (check file contents, run tests, confirm services).
 
 Think carefully; response quality is the highest priority. You have unlimited thinking tokens."""
-        if self.memory_enabled:
-            memory_prompt = """
-
-**MEMORY SYSTEM:** You have access to a persistent memory system that allows you to store and retrieve information across sessions. Use it strategically:
-
-**Memory Management Strategies:**
-1. **Store Important Information:** When you learn something valuable (configurations, file paths, user preferences, technical solutions, project details), use `store_memory` to save it.
-2. **Retrieve Relevant Context:** When starting a new task or dealing with a similar problem, use `retrieve_memories` or `search_memories` to find helpful information.
-3. **Categorize Appropriately:** Use categories like:
-   - 'technical_note' for technical knowledge
-   - 'project' for project-specific information
-   - 'user_preference' for user preferences
-   - 'configuration' for system settings
-   - 'bug_fix' for bug solutions
-   - 'learning' for new concepts learned
-4. **Prioritize by Importance:** Rate information 1-5 based on importance (5 = critical)
-5. **Add Tags:** Use descriptive tags for easier searching later
-
-**Memory Functions Available:**
-- `store_memory`: Save important information
-- `retrieve_memories`: Get filtered memories
-- `search_memories`: Search by content/tags
-- `delete_memory`: Remove outdated memories
-
-**Example Usage:**
-- When learning a user's preference: store their preference as 'user_preference' with high importance
-- When fixing a bug: store the solution as 'bug_fix' with relevant tags
-- When configuring a system: store settings as 'configuration'
-- When learning new technical information: store as 'technical_note' or 'learning'
-
-Use memory to build long-term knowledge and provide better, more consistent assistance across sessions."""
-            return base_prompt + memory_prompt
-
         return base_prompt
 
     def execute_bash_command(self, command: str) -> Tuple[str, int]:
         """Execute a bash command with timeout and return output and exit code"""
-        self._log(f"\n[EXECUTING] {command}")
-
         output_buffer = bytearray()
 
         try:
@@ -962,83 +607,9 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
         return final_output, exit_code
 
-    def handle_store_memory(self, args: Dict[str, Any]) -> str:
-        """Handle store_memory function call"""
-        if not self.memory_manager:
-            return "Memory system is not enabled"
-
-        content = args.get('content', '')
-        category = args.get('category', 'general')
-        importance = args.get('importance', 1)
-        tags = args.get('tags', '')
-
-        memory_id = self.memory_manager.store_memory(content, category, importance, tags)
-
-        return f"Memory stored successfully with ID {memory_id}. Category: {category}, Importance: {importance}"
-
-    def handle_retrieve_memories(self, args: Dict[str, Any]) -> str:
-        """Handle retrieve_memories function call"""
-        if not self.memory_manager:
-            return "Memory system is not enabled"
-
-        limit = args.get('limit', 10)
-        category = args.get('category')
-        min_importance = args.get('min_importance')
-        search_query = args.get('search_query')
-
-        memories = self.memory_manager.retrieve_memories(
-            limit=limit, category=category, min_importance=min_importance, search_query=search_query
-        )
-
-        if not memories:
-            return "No memories found matching the criteria."
-
-        result = f"Retrieved {len(memories)} memories:\n\n"
-        for memory in memories:
-            result += f"ID: {memory['id']} | Category: {memory['category']} | Importance: {memory['importance']} | Tags: {memory['tags']}\n"
-            result += f"Content: {memory['content']}\n"
-            result += f"Timestamp: {memory['timestamp']} | Accessed: {memory['access_count']} times\n\n"
-
-        return result.strip()
-
-    def handle_search_memories(self, args: Dict[str, Any]) -> str:
-        """Handle search_memories function call"""
-        if not self.memory_manager:
-            return "Memory system is not enabled"
-
-        query = args.get('query', '')
-        limit = args.get('limit', 10)
-
-        memories = self.memory_manager.search_memories(query, limit)
-
-        if not memories:
-            return f"No memories found matching query: '{query}'"
-
-        result = f"Found {len(memories)} memories matching '{query}':\n\n"
-        for memory in memories:
-            result += f"ID: {memory['id']} | Category: {memory['category']} | Importance: {memory['importance']}\n"
-            result += f"Content: {memory['content']}\n\n"
-
-        return result.strip()
-
-    def handle_delete_memory(self, args: Dict[str, Any]) -> str:
-        """Handle delete_memory function call"""
-        if not self.memory_manager:
-            return "Memory system is not enabled"
-
-        memory_id = args.get('memory_id')
-
-        deleted = self.memory_manager.delete_memory(memory_id)
-
-        if deleted:
-            return f"Memory {memory_id} deleted successfully."
-        else:
-            return f"Memory {memory_id} not found."
-
     def get_user_confirmation(self, command: str) -> Tuple[bool, Optional[str]]:
         """Get user confirmation for command execution via the sink"""
         if self.auto_approve:
-            self._log(f"[AUTO-APPROVED] {command}")
             return True, None
 
         # Ask the sink for approval.  ConsoleSink uses builtins.input() (CLI);
@@ -1173,8 +744,6 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
         for attempt in range(1, max_retries + 1):
             try:
-                self._log(f"\n[LLM STREAMING RESPONSE] ", end="", flush=True)
-
                 collected_content = ""
                 collected_thinking = ""
                 collected_tool_calls = []
@@ -1222,7 +791,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
                                 # If we were in thinking mode, show transition
                                 if self.show_thinking and in_thinking and thinking_buffer:
-                                    self._log("\n[THINKING COMPLETE]")
+                                    self._log("[THINKING COMPLETE]")
                                     in_thinking = False
 
                                 # Emit content chunk to the sink in real-time
@@ -1266,7 +835,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
         # Store thinking content if any was collected and thinking display is enabled
         if self.show_thinking and collected_thinking:
-            self._log(f"\n[THINKING SUMMARY]")
+            self._log(f"[THINKING SUMMARY]")
             self._log(collected_thinking)
             self._log("")
 
@@ -1370,16 +939,37 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                     f"inside strings (use \\n), no trailing commas, and the entire "
                     f"argument is a single valid JSON object.")
 
-        if function_name == "store_memory":
-            return self.handle_store_memory(args)
-        elif function_name == "retrieve_memories":
-            return self.handle_retrieve_memories(args)
-        elif function_name == "search_memories":
-            return self.handle_search_memories(args)
-        elif function_name == "delete_memory":
-            return self.handle_delete_memory(args)
-        else:
-            return f"Unknown function: {function_name}"
+        return f"Unknown function: {function_name}"
+
+    def inject_suggestion(self, suggestion: str):
+        """Inject a mid-run user suggestion into the agent stream.
+
+        The suggestion is queued and drained by the agent thread at the start
+        of the next step, where it is appended to the conversation history
+        as a user message.  This lets the user steer behavior while the agent
+        is executing without interrupting it.
+        """
+        if suggestion and suggestion.strip():
+            self.suggestion_queue.put(suggestion.strip())
+
+    def _drain_suggestions(self):
+        """Drain any queued user suggestions into the conversation history.
+
+        Called at the start of each step.  Each suggestion is appended as
+        a user message so the LLM sees it on the next API call.
+        """
+        suggestions = []
+        while not self.suggestion_queue.empty():
+            try:
+                suggestions.append(self.suggestion_queue.get_nowait())
+            except queue.Empty:
+                break
+        for s in suggestions:
+            self.conversation_history.append({
+                "role": "user",
+                "content": f"[Suggestion from user] {s}"
+            })
+            self._log(f"[USER SUGGESTION] {s}")
 
     def run_interactor(self, user_request: str):
         """Main interactive loop"""
@@ -1388,7 +978,6 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             "api_base": self.base_url,
             "model": self.model,
             "auto_approve": self.auto_approve,
-            "memory_enabled": self.memory_enabled,
             "max_prompt_len": self.max_prompt_len,
         })
         self._log(f"[USER REQUEST] {user_request}")
@@ -1400,17 +989,20 @@ Use memory to build long-term knowledge and provide better, more consistent assi
             {"role": "user", "content": user_request}
         ]
 
-        iteration = 0
+        step = 0
 
         try:
-            while iteration < self.max_iterations and not self.stop_event.is_set():
+            while step < self.max_steps and not self.stop_event.is_set():
 
                 if self.debug:
                     self._dump_conversation_history()
 
-                iteration += 1
-                self._log(f"\n[ITERATION {iteration}/{self.max_iterations}]")
-                self.sink.emit("STATUS_UPDATE", {"iteration": iteration, "max_iterations": self.max_iterations, "phase": "llm_call"})
+                step += 1
+                self.sink.emit("STATUS_UPDATE", {"step": step, "max_steps": self.max_steps, "phase": "llm_call"})
+
+                # Inject any mid-run user suggestions into the conversation
+                # before the next LLM call so behavior can be steered.
+                self._drain_suggestions()
 
                 # Truncate conversation history if it exceeds max_prompt_len
                 self._truncate_conversation_history()
@@ -1419,7 +1011,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
                 # Check if this is a safety-stop response (empty validated messages)
                 if not response.get("choices") or not response.get("choices", [{}])[0].get("message"):
-                    self._log(f"\n[SAFETY STOP] API call returned no valid response. Ending interaction.")
+                    self._log(f"[SAFETY STOP] API call returned no valid response. Ending interaction.")
                     break
 
                 assistant_message = response["choices"][0]["message"]
@@ -1430,7 +1022,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                     not assistant_message.get("tool_calls") and
                     not assistant_message.get("reasoning_content") and
                     len(_content_raw) < 200):
-                    self._log(f"\n[SAFETY STOP - TERMINAL] Terminal state reached. Ending interaction safely.")
+                    self._log(f"[SAFETY STOP - TERMINAL] Terminal state reached. Ending interaction safely.")
                     break
 
                 # Remove reasoning_content from the stored message to avoid
@@ -1448,16 +1040,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                 content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls = self.process_llm_response(response)
 
 
-                self._log(f"\n[LLM RESPONSE]")
-                self._log(content)
-
-                # Store conversation in memory if enabled
-                if self.memory_manager:
-                    # Store both content and thinking if available
-                    full_content = content
-                    if thinking:
-                        full_content = f"THINKING: {thinking}\n\nRESPONSE: {content}"
-                    self.memory_manager.store_conversation(self.session_id, "assistant", full_content)
+                self._log(content.strip())
 
                 # Handle malformed tool calls - notify the LLM and request a corrected response
                 if malformed_tool_calls:
@@ -1480,16 +1063,14 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                             "tool_call_id": mal["tool_call_id"],
                             "content": err_msg,
                         })
-                    self._log(f"[INFO] Correction messages appended. Continuing to next iteration for LLM to fix the tool calls.")
-                    # Do not proceed with normal tool execution this iteration; let the loop continue
+                    self._log(f"[INFO] Correction messages appended. Continuing to next step for LLM to fix the tool calls.")
+                    # Do not proceed with normal tool execution this step; let the loop continue
                     # so the LLM can re-issue corrected tool calls.
                     continue
 
                 # Execute ALL tool calls if any were provided
                 if tool_calls_info:
-                    self._log(f"[INFO] Executing {len(tool_calls_info)} tool call(s)...")
-
-                    for idx, tc_info in enumerate(tool_calls_info):
+                    for tc_info in tool_calls_info:
                         if self.stop_event.is_set():
                             self._log("[STOP] Agent shutdown requested. Aborting tool execution.")
                             break
@@ -1498,8 +1079,6 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                         function_name = tc_info.get("function_name")
 
                         if not command:
-                            # Non-execute_bash tool call (memory functions); route to handle_function_call
-                            self._log(f"[INFO] Tool call {idx+1}/{len(tool_calls_info)} has no command to execute (function={function_name}). Handling memory function call.")
                             if tool_call_id and function_name:
                                 result = self.handle_function_call({"name": function_name, "arguments": tc_info["function_arguments"]})
                                 self.conversation_history.append({
@@ -1509,14 +1088,13 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                                 })
                             continue
 
-                        self._log(f"[TOOL CALL {idx+1}/{len(tool_calls_info)}] {command}")
-
                         # Notify sink that a command is about to execute
                         self.sink.emit("CMD_EXEC", {"command": command, "tool_call_id": tool_call_id, "function_name": function_name})
 
                         approved, user_suggestion = self.get_user_confirmation(command)
 
                         if approved:
+                            self._log(f"[Executing{' (AUTO)' if self.auto_approve else ''}] {command}", end="")
                             try:
                                 output, exit_code = self.execute_bash_command(command)
 
@@ -1526,11 +1104,6 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                                         "tool_call_id": tool_call_id,
                                         "content": f"Command executed with exit code {exit_code}.\nOutput:\n{output}"
                                     })
-
-                                    # Store conversation in memory if enabled
-                                    if self.memory_manager:
-                                        self.memory_manager.store_conversation(self.session_id, "tool",
-                                            f"Command: {command}\nExit: {exit_code}\nOutput: {output[:500]}...")
 
                             except CommandTimeoutError as e:
                                 error_msg = str(e)
@@ -1568,7 +1141,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                                         "content": f"I suggest you {user_suggestion}"
                                     })
                 else:
-                    self._log(f"[INFO] No tool calls to execute in this iteration")
+                    self._log(f"[INFO] No tool calls to execute in this step")
                     _content_check = content if isinstance(content, str) else ""
 
                     if _content_check.strip().endswith(self.COMPLETION_MARKER) or self.COMPLETION_MARKER in _content_check:
@@ -1578,7 +1151,7 @@ Use memory to build long-term knowledge and provide better, more consistent assi
                     # The assistant stopped without calling tools and without signaling
                     # completion.  This is a premature stop - the task is NOT finished.
                     # Inject a continuation message so the LLM keeps working until done.
-                    self._log(f"[CONTINUATION] Assistant provided a response without tool calls and without completion signal. Task is not finished. Injecting continuation prompt.")
+                    self._log("Assistant provided a response without tool calls and without completion signal. Task is not finished. Injecting continuation prompt.")
 
                     continuation_msg = (
                         f"Continue working on the task. You previously responded without using any tools. "
@@ -1593,12 +1166,12 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
                 # Check for task completion AFTER command execution
                 if self.COMPLETION_MARKER in content:
-                    self._log(f"\n[{self.COMPLETION_MARKER} DETECTED - TASK COMPLETED SUCCESSFULLY]")
+                    self._log(f"[{self.COMPLETION_MARKER} DETECTED - TASK COMPLETED SUCCESSFULLY]")
                     break
 
-                # Check if we've reached max iterations
-                if iteration >= self.max_iterations:
-                    self._log(f"[LIMIT REACHED] Maximum iterations ({self.max_iterations}) exceeded")
+                # Check if we've reached max steps
+                if step >= self.max_steps:
+                    self._log(f"[LIMIT REACHED] Maximum steps ({self.max_steps}) exceeded")
 
         finally:
             self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated"})
@@ -1613,14 +1186,12 @@ Use memory to build long-term knowledge and provide better, more consistent assi
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Advanced LLM Interactor Tool with Enhanced Memory")
+    parser = argparse.ArgumentParser(description="Advanced LLM Interactor Tool")
     parser.add_argument("--api-base", required=True, help="API base URL")
     parser.add_argument("--model", required=True, help="Model name")
     parser.add_argument("--api-key", required=True, help="API key")
     parser.add_argument("--auto-approve", action="store_true",
                         help="Auto-approve command execution (for testing)")
-    parser.add_argument("--no-memory", action="store_true",
-                        help="Disable memory system")
     parser.add_argument("--no-thinking", action="store_true",
                         help="Hide thinking tokens from output")
     parser.add_argument("--timeout", type=int, default=30,
@@ -1651,7 +1222,6 @@ def main():
             model=args.model,
             api_key=args.api_key,
             auto_approve=args.auto_approve,
-            memory_enabled=not args.no_memory,
             show_thinking=not args.no_thinking,
             command_timeout=args.timeout,
             max_prompt_len=args.max_prompt_len,
@@ -1663,7 +1233,7 @@ def main():
             user_request = " ".join(args.request)
             interactor.run_interactor(user_request)
         except KeyboardInterrupt:
-            interactor._log("\n[INTERRUPTED] Interactor stopped by user")
+            interactor._log("[INTERRUPTED] Interactor stopped by user")
             sys.exit(0)
         except Exception as e:
             interactor._log_error(f"\n[FATAL ERROR] An unexpected error occurred:")
@@ -1700,7 +1270,7 @@ def main():
             │  - tool-call summaries
             ├────────────────────────────────────────────────────────────┐
             │  [4] Status Footer
-            │  - model | tok/s | iterations | session id | auto-approve status
+            │  - model | tok/s | steps | session id | auto-approve status
             └────────────────────────────────────────────────────────────┘
 
         The agent runs in a background thread and pushes events to a queue.
@@ -1720,21 +1290,29 @@ def main():
             margin-bottom: 1;
         }
         #prompt-container {
-            background: #1a1a1a;
-            border: solid #333333;
-            padding: 1;
+            background: #000000;
+            border: solid #444444;
+            height: 5;
             margin-bottom: 1;
         }
-        #prompt-input {
-            background: #000000;
+        #prompt-container:focus-within {
+            border: tall #00aa00;
+        }
+        #prompt-marker {
             color: #00ff00;
-            border: solid #444444;
-            padding: 0 2;
-            width: 100%;
+            width: 1;
+            height: 3;
+        }
+        #prompt-input {
+            background: transparent;
+            border: none;
+            color: #00ff00;
+            padding: 0 1;
+            width: 1fr;
             height: 3;
         }
         #prompt-input:focus {
-            border: tall #00aa00;
+            border: none;
         }
         #prompt-input > .input--cursor {
             background: #00ff00;
@@ -1781,8 +1359,8 @@ def main():
             self.stop_event = threading.Event()
             self.agent_thread: Optional[threading.Thread] = None
             self.auto_approve = args.auto_approve
-            self.iteration_count = 0
-            self.max_iterations = 500
+            self.step_count = 0
+            self.max_steps = 500
             self.tokens_per_second = 0.0
             # Token-rate tracking state.  We count streamed chunks (each is
             # roughly one token) and compute a rolling rate over a short
@@ -1819,8 +1397,13 @@ def main():
                 id="warning-banner",
                 markup=False
             )
-            # Prompt input field (top-left)
-            yield Input(id="prompt-input", placeholder="Type a prompt or /command, then Enter")
+            # Prompt input field (top-left), with a shell-style "> " marker
+            # preceding it as a visual cue.
+            yield Horizontal(
+                Static(">", id="prompt-marker", markup=False),
+                Input(id="prompt-input", placeholder="Type a prompt or /command, then Enter"),
+                id="prompt-container",
+            )
             # Console output panel (top-right) - RichLog for streaming command output
             console = RichLog(id="console-log", auto_scroll=True, wrap=True, max_lines=1000)
             console.border_title = "Console Output"
@@ -1855,9 +1438,6 @@ def main():
             cli_request = " ".join(self.args.request) if self.args.request else ""
             self.args.request = []
             if cli_request.strip():
-                self._write_agent(
-                    f"[CLI REQUEST] Auto-starting agent with the request supplied on the command line:\n  {cli_request[:200]}"
-                )
                 self._cli_request = cli_request
                 self.set_timer(0.5, self._autostart_once)
 
@@ -1866,7 +1446,7 @@ def main():
             ap_status = "ON" if self.auto_approve else "OFF"
             status_text = (
                 f"Model: {self.model_name} | "
-                f"Iter: {self.iteration_count}/{self.max_iterations} | "
+                f"Step: {self.step_count}/{self.max_steps} | "
                 f"tok/s: {self.tokens_per_second:.1f} | "
                 f"Session: {self.session_id} | "
                 f"Auto-approve: {ap_status} | "
@@ -1903,11 +1483,10 @@ def main():
                 self._write_agent(f"  API: {payload.get('api_base','')}", style="blue")
                 self._write_agent(f"  Model: {payload.get('model','')}", style="blue")
                 self._write_agent(f"  Auto-approve: {payload.get('auto_approve', False)}", style="blue")
-                self._write_agent(f"  Memory: {payload.get('memory_enabled', False)}", style="blue")
                 self._write_agent(f"  Max prompt len: {payload.get('max_prompt_len', 0)}", style="blue")
                 self._write_agent("  [!] Agent starting. Commands will require approval unless /autoapprove is toggled.", style="yellow")
             elif kind == "LOG":
-                self._write_agent(payload.get("text", ""))
+                self._write_agent(payload.get("text", ""), end=payload.get("end", "\n"))
             elif kind == "ERROR":
                 self._write_agent(f"[ERROR] {payload.get('text', '')}", style="bold red")
             elif kind == "LLM_STREAM":
@@ -1947,8 +1526,8 @@ def main():
                 self.pending_approval = None
                 self._refresh_approval_prompt()
             elif kind == "STATUS_UPDATE":
-                self.iteration_count = payload.get("iteration", 0)
-                self.max_iterations = payload.get("max_iterations", 500)
+                self.step_count = payload.get("step", 0)
+                self.max_steps = payload.get("max_steps", 500)
                 # If no tokens have streamed recently, decay the displayed
                 # rate so it doesn't show a stale value while the agent is
                 # running commands or waiting on approval.
@@ -1982,7 +1561,7 @@ def main():
             if self._tok_window_tokens == 0 and time.monotonic() - self._tok_window_start >= 2.0:
                 self.tokens_per_second = 0.0
 
-        def _write_agent(self, text: str, streaming: bool = False, prefix: str = "", style: str = ""):
+        def _write_agent(self, text: str, streaming: bool = False, prefix: str = "", style: str = "", end: str = "\n"):
             """Write text to the agent output RichLog (bottom panel).
 
             When *streaming* is True (LLM/Thinking tokens) the text is
@@ -2102,9 +1681,18 @@ def main():
                 return False  # returning False cancels the recurring interval
 
         def _start_agent(self, prompt: str):
-            """Start the agent thread with the given prompt."""
+            """Start the agent thread with the given prompt.
+
+            If the agent is already running, the typed text is injected into
+            the agent stream as a mid-run user suggestion so behavior can be
+            steered while the agent is executing.
+            """
             if self.agent_thread and self.agent_thread.is_alive():
-                self._write_agent("[ERROR] Agent is already running.")
+                if self.agent:
+                    self.agent.inject_suggestion(prompt)
+                    self._write_agent(f"[SUGGESTION QUEUED] Steering agent: {prompt}")
+                else:
+                    self._write_agent("[ERROR] Agent is running but not available for suggestions.")
                 return
             # Clear the stop event so the new agent run starts fresh.
             self.stop_event.clear()
@@ -2115,7 +1703,6 @@ def main():
                 model=self.model_name,
                 api_key=self.args.api_key,
                 auto_approve=self.auto_approve,
-                memory_enabled=not self.args.no_memory,
                 show_thinking=not self.args.no_thinking,
                 command_timeout=self.args.timeout,
                 max_prompt_len=self.args.max_prompt_len,
@@ -2129,7 +1716,6 @@ def main():
                 daemon=True
             )
             self.agent_thread.start()
-            self._write_agent(f"[AGENT STARTED] Processing: {prompt[:80]}...")
 
         def _stop_agent(self):
             """Stop the agent thread cleanly."""
