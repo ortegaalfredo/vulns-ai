@@ -30,11 +30,18 @@ from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from openai import OpenAI
 
+# Cloudflare-friendly user-agent used for ALL outbound HTTP requests so the
+# script is not flagged as a bot and the IP does not get blocked. It is sent
+# as a header on OpenAI API calls and injected into curl/wget/other tools run
+# through execute_bash_command.
+USER_AGENT = 'Mozilla/5.0 (compatible; OpenAI-Client/1.0)'
+
 try:
     # Textual is only required for TUI mode; --nogui runs without it.
     import textual
     from textual.app import App, ComposeResult
-    from textual.widgets import RichLog, Input, Static
+    from textual.widgets import RichLog, Input, Static, Button
+    from textual.screen import ModalScreen
     from textual.containers import Horizontal, Vertical
     from textual import events
     from textual.binding import Binding
@@ -156,7 +163,7 @@ class ConsoleSink(EventSink):
         elif kind == "LLM_STREAM":
             print(f"{colors.CYAN}{text}{colors.END}", end=end, flush=flush)
         elif kind == "THINKING_STREAM":
-            print(f"{colors.MAGENTA}{text}{colors.END}", end=end, flush=flush)
+            print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
         elif kind == "CMD_OUTPUT":
             print(f"{colors.GREEN}{text}{colors.END}", end=end, flush=flush)
         elif kind == "CMD_EXEC":
@@ -165,6 +172,12 @@ class ConsoleSink(EventSink):
             print(f"{colors.BOLD}{text}{colors.END}", end=end, flush=flush)
         elif kind == "SYSTEM":
             print(f"{colors.BOLD}{colors.BLUE}{text}{colors.END}", end=end, flush=flush)
+        elif kind == "LOG":
+            style = payload.get("style", "")
+            if style == "yellow":
+                print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
+            else:
+                print(text, end=end, flush=flush)
         else:
             print(text, end=end, flush=flush)
 
@@ -211,13 +224,19 @@ class TUISink(EventSink):
         if self.auto_approve:
             return "y"
 
-        # Push an approval request event so the TUI can display it
+        # Create the event FIRST so the TUI thread can never resolve the
+        # request before we start waiting on it (race condition).  Only after
+        # the event object exists do we push the APPROVAL_REQUEST event; the
+        # main thread may then call resolve_approval() at any point and the
+        # set() will land on an event we are about to wait on.
+        self._approval_event = threading.Event()
+        self._approval_response = None
+
+        # Push an approval request event so the TUI can display the dialog
         self.emit("APPROVAL_REQUEST", {"command": prompt})
 
         # Block until the TUI user resolves the request or the agent is
         # shutting down.  Poll every 100 ms so we can react to stop_event.
-        self._approval_event = threading.Event()
-        self._approval_response = None
         while not self._approval_event.is_set():
             if self.stop_event.is_set():
                 self._approval_event = None
@@ -232,13 +251,14 @@ class TUISink(EventSink):
 
     def resolve_approval(self, approved: bool, suggestion: str = ""):
         """Called by the TUI (main thread) when the user responds to a
-        pending approval request.  /approve → approved=True;
-        /reject → approved=False; /suggest <text> → approved=False,
-        suggestion=<text>."""
+        pending approval request.  approved=True → "y";
+        approved=False → suggestion if given else "n"."""
         if approved:
             self._approval_response = "y"
         else:
             self._approval_response = suggestion if suggestion else "n"
+        # set() is idempotent and thread-safe; safe to call even if the agent
+        # thread has not yet reached the wait() (it will return immediately).
         if self._approval_event:
             self._approval_event.set()
 
@@ -254,12 +274,16 @@ class LLMInteractor:
     def __init__(self, api_base: str, model: str, api_key: str, auto_approve: bool = False,
                   show_thinking: bool = True, command_timeout: int = 30,
                   max_prompt_len: int = 20000, max_output_bytes: int = 10240, debug: bool = False,
-                  sink: EventSink = None):
+                  sink: EventSink = None, persist_history: bool = False):
         self.base_url = api_base.rstrip('/')
         self.model = model
         self.api_key = api_key
         self.auto_approve = auto_approve
         self.conversation_history = []
+        # When True, run_interactor() continues any existing conversation
+        # history (carried over from a previous run) instead of resetting it.
+        # This lets a fresh command keep the full chat context of past sessions.
+        self.persist_history = persist_history
         self.max_steps = 500
         self.max_tokens = 8000
         self.command_timeout = command_timeout
@@ -283,10 +307,18 @@ class LLMInteractor:
         # user messages so behavior can be steered mid-execution.
         self.suggestion_queue: queue.Queue = queue.Queue()
 
-        # Initialize OpenAI client
+        # Tracks whether the [SYSTEM] LLM INTERACTOR STARTED banner has already
+        # been displayed.  run_interactor() is re-entered for every new prompt,
+        # but the banner should only appear once per session.
+        self._started_banner_shown = False
+
+        # Initialize OpenAI client. default_headers ensures the User-Agent is
+        # sent on every API call so endpoints behind Cloudflare do not treat
+        # the OpenAI SDK's default agent as a bot and block the IP.
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            default_headers={'User-Agent': USER_AGENT}
         )
 
         # Tool schemas
@@ -310,9 +342,9 @@ class LLMInteractor:
             }
         ]
 
-    def _log(self, message: str, end: str = '\n', flush: bool = True):
+    def _log(self, message: str, end: str = '\n', flush: bool = True, style: str = ""):
         """Emit a log event via the sink."""
-        self.sink.emit("LOG", {"text": message, "end": end, "flush": flush})
+        self.sink.emit("LOG", {"text": message, "end": end, "flush": flush, "style": style})
 
     def _log_error(self, message: str):
         """Emit an error event via the sink."""
@@ -452,8 +484,24 @@ Think carefully; response quality is the highest priority. You have unlimited th
                 os.setsid()
             except OSError:
                 pass
+            # Export the same Cloudflare-friendly User-Agent used by the OpenAI
+            # client. curl/wget (and any tool honoring HTTP_USER_AGENT) will
+            # inherit it so Cloudflare sees a consistent, browser-like agent and
+            # does not flag the script as a bot or block the IP.
             try:
-                os.execvp("/bin/sh", ["/bin/sh", "-c", command])
+                os.environ["HTTP_USER_AGENT"] = USER_AGENT
+            except Exception:
+                pass
+            # Shell functions that force curl/wget to send our User-Agent, so
+            # even tools that ignore the HTTP_USER_AGENT env var stay consistent.
+            _ua_wrapper = (
+                'export HTTP_USER_AGENT="%s"; '
+                'curl() { command curl -A "$HTTP_USER_AGENT" "$@"; }; '
+                'wget() { command wget --user-agent="$HTTP_USER_AGENT" "$@"; }; '
+                '%s'
+            ) % (USER_AGENT, command)
+            try:
+                os.execvp("/bin/sh", ["/bin/sh", "-c", _ua_wrapper])
             except OSError as e:
                 os.write(2, f"Child process error (os.execvp failed): {e}\n".encode('utf-8'))
                 os._exit(1)
@@ -791,7 +839,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
                                 # If we were in thinking mode, show transition
                                 if self.show_thinking and in_thinking and thinking_buffer:
-                                    self._log("[THINKING COMPLETE]")
+                                    self._log("[THINKING COMPLETE]", style="yellow")
                                     in_thinking = False
 
                                 # Emit content chunk to the sink in real-time
@@ -832,12 +880,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
         self._log("")
         final_tool_calls = [tc for tc in collected_tool_calls if tc.get("id")]
-
-        # Store thinking content if any was collected and thinking display is enabled
-        if self.show_thinking and collected_thinking:
-            self._log(f"[THINKING SUMMARY]")
-            self._log(collected_thinking)
-            self._log("")
 
         final_response = {
             "choices": [{
@@ -973,21 +1015,40 @@ Think carefully; response quality is the highest priority. You have unlimited th
 
     def run_interactor(self, user_request: str):
         """Main interactive loop"""
-        self.sink.emit("SYSTEM", {
-            "text": "[LLM INTERACTOR STARTED]",
-            "api_base": self.base_url,
-            "model": self.model,
-            "auto_approve": self.auto_approve,
-            "max_prompt_len": self.max_prompt_len,
-        })
+        # Emit the startup banner only on the first prompt.  run_interactor()
+        # is called again for each new prompt, so without this guard the banner
+        # would be reprinted every time.
+        if not self._started_banner_shown:
+            self._started_banner_shown = True
+            self.sink.emit("SYSTEM", {
+                "text": "[LLM INTERACTOR STARTED]",
+                "api_base": self.base_url,
+                "model": self.model,
+                "auto_approve": self.auto_approve,
+                "max_prompt_len": self.max_prompt_len,
+            })
         self._log(f"[USER REQUEST] {user_request}")
         self._log(f"{'='*60}")
 
-        # Initialize conversation with system prompt and user request
-        self.conversation_history = [
-            {"role": "system", "content": self.get_system_prompt()},
-            {"role": "user", "content": user_request}
-        ]
+        # Initialize conversation with system prompt and user request.
+        # When persist_history is enabled, we keep any prior conversation
+        # (from an earlier command in the same session) so the new request
+        # continues the full chat context instead of starting fresh.  The
+        # system prompt is refreshed in place at index 0.
+        if self.persist_history and self.conversation_history:
+            self.conversation_history[0] = {
+                "role": "system",
+                "content": self.get_system_prompt()
+            }
+            self.conversation_history.append({
+                "role": "user",
+                "content": user_request
+            })
+        else:
+            self.conversation_history = [
+                {"role": "system", "content": self.get_system_prompt()},
+                {"role": "user", "content": user_request}
+            ]
 
         step = 0
 
@@ -1022,7 +1083,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     not assistant_message.get("tool_calls") and
                     not assistant_message.get("reasoning_content") and
                     len(_content_raw) < 200):
-                    self._log(f"[SAFETY STOP - TERMINAL] Terminal state reached. Ending interaction safely.")
                     break
 
                 # Remove reasoning_content from the stored message to avoid
@@ -1039,8 +1099,10 @@ Think carefully; response quality is the highest priority. You have unlimited th
                     self.conversation_history.append(clean_message)
                 content, tool_calls_info, first_tool_call_id, thinking, malformed_tool_calls = self.process_llm_response(response)
 
-
-                self._log(content.strip())
+                # NOTE: The LLM content is NOT re-printed here.  It was already
+                # streamed token-by-token via sink.emit("LLM_STREAM", ...) inside
+                # call_llm_api().  Re-printing the full content here would show
+                # the same text twice.
 
                 # Handle malformed tool calls - notify the LLM and request a corrected response
                 if malformed_tool_calls:
@@ -1141,7 +1203,6 @@ Think carefully; response quality is the highest priority. You have unlimited th
                                         "content": f"I suggest you {user_suggestion}"
                                     })
                 else:
-                    self._log(f"[INFO] No tool calls to execute in this step")
                     _content_check = content if isinstance(content, str) else ""
 
                     if _content_check.strip().endswith(self.COMPLETION_MARKER) or self.COMPLETION_MARKER in _content_check:
@@ -1176,12 +1237,97 @@ Think carefully; response quality is the highest priority. You have unlimited th
         finally:
             self.sink.emit("SHUTDOWN", {"reason": "agent_loop_terminated"})
 
-        self._log(f"\n{'='*60}")
-        self._log(f"[INTERACTOR FINISHED]")
-
         # Clear any pending approval gate on shutdown
         if hasattr(self.sink, 'close'):
             self.sink.close()
+
+
+class ApprovalScreen(ModalScreen):
+    """Modal dialog that blocks the whole UI and asks the user to approve
+    or reject a pending bash command.
+
+    The agent thread is blocked in TUISink.input() waiting on a
+    threading.Event.  When the user presses [Y]es or [N]o (or clicks the
+    buttons), this screen calls the app's approval callback, which resolves
+    the sink's event and unblocks the agent.  Because it is a ModalScreen,
+    the rest of the TUI is inert until a choice is made — the agent cannot
+    continue past the gate.
+
+    The screen itself is a full-screen dimmed overlay; the actual dialog is
+    a small centered box (see #approval-dialog) so it reads as a pop-up in
+    the middle of the console rather than covering the whole screen.
+    """
+
+    CSS = """
+    ApprovalScreen {
+        align: center middle;
+        background: $surface 50%;
+    }
+    #approval-dialog {
+        width: 72;
+        max-width: 85%;
+        height: auto;
+        max-height: 60%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #approval-message {
+        width: 100%;
+        height: auto;
+        padding: 0 1;
+    }
+    #approval-buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+        padding-top: 1;
+    }
+    #approval-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(self, command: str, on_decision):
+        super().__init__()
+        self.command = command
+        self._on_decision = on_decision
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="approval-dialog"):
+            yield Static(
+                "⚠ APPROVAL REQUIRED ⚠\n\n"
+                "The agent wants to execute the following command:\n\n"
+                f"  {self.command}\n\n"
+                "Press  Y  to approve and run it, or  N  to reject it.",
+                id="approval-message",
+            )
+            with Horizontal(id="approval-buttons"):
+                yield Button("Yes (Y)", id="approve-yes", variant="success")
+                yield Button("No (N)", id="approve-no", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed):
+        approved = event.button.id == "approve-yes"
+        self._resolve(approved)
+
+    def _resolve(self, approved: bool):
+        self._on_decision(approved)
+        self.dismiss()
+
+    # Screen-level bindings: these fire regardless of which widget has focus
+    # (e.g. a Button), so pressing Y/N always selects the option.
+    BINDINGS = [
+        Binding("y", "approve", "Approve", show=False),
+        Binding("n", "reject", "Reject", show=False),
+        Binding("enter", "approve", "Approve", show=False),
+        Binding("escape", "reject", "Reject", show=False),
+    ]
+
+    def action_approve(self):
+        self._resolve(True)
+
+    def action_reject(self):
+        self._resolve(False)
 
 
 def main():
@@ -1258,17 +1404,17 @@ def main():
     class InteractorApp(App):
         """Textual TUI for the LLM Interactor.
 
-        Layout (4 regions):
+        Layout (Norton-Commander / Midnight-Commander style):
             ┌────────────────────────────────┬───────────────────────────┐
-            │  [1] Prompt Input (top-left)    │  [2] Console Log (top-right)
-            │  - user prompt entry            │  - command output (live)
-            │  - /autoapprove toggle          │  - exit codes
+            │  [1] Agent Output (left)        │  [2] Console Log (right)
+            │  - LLM reasoning/thinking       │  - command output (live)
+            │  - LLM text responses          │  - exit codes
+            │  - tool-call summaries          │
             ├────────────────────────────────┴───────────────────────────┤
-            │  [3] Agent Output (bottom, full width)
-            │  - LLM reasoning/thinking
-            │  - LLM text responses
-            │  - tool-call summaries
-            ├────────────────────────────────────────────────────────────┐
+            │  [3] Prompt Input (bottom, full width)
+            │  - user prompt entry
+            │  - /autoapprove toggle
+            ├────────────────────────────────────────────────────────────┤
             │  [4] Status Footer
             │  - model | tok/s | steps | session id | auto-approve status
             └────────────────────────────────────────────────────────────┘
@@ -1280,33 +1426,33 @@ def main():
 
         CSS = """
         Screen {
-            background: #0a0a0a;
+            background: #3465a4;
         }
         #warning-banner {
-            background: #4a0000;
-            color: #ff0000;
+            background: #06989a;
+            color: #000000;
             padding: 1 2;
-            border: solid #8b0000;
+            border: solid #0000A0;
             margin-bottom: 1;
         }
         #prompt-container {
             background: #000000;
-            border: solid #444444;
+            border: none;
             height: 5;
-            margin-bottom: 1;
+            margin-top: 1;
         }
         #prompt-container:focus-within {
-            border: tall #00aa00;
+            border: none;
         }
         #prompt-marker {
-            color: #00ff00;
+            color: #06989a;
             width: 1;
             height: 3;
         }
         #prompt-input {
             background: transparent;
             border: none;
-            color: #00ff00;
+            color: #f2f2f2;
             padding: 0 1;
             width: 1fr;
             height: 3;
@@ -1315,30 +1461,34 @@ def main():
             border: none;
         }
         #prompt-input > .input--cursor {
-            background: #00ff00;
-            color: #000000;
+            background: #06989a;
+            color: #3465a4;
         }
         #status-bar {
-            background: #1a1a1a;
-            color: #ff6600;
-            padding: 1 2;
-            border-top: solid #444444;
+            background: #06989a;
+            color: #000000;
+            height: 1;
+            padding: 0 1;
+        }
+        #panels {
+            height: 1fr;
         }
         RichLog {
-            border: solid #444444;
+            border: solid #f2f2f2;
             padding: 0;
+            height: 1fr;
         }
         #console-log {
-            background: #000000;
-            color: #00ff00;
-            border: solid #006600;
-            margin-bottom: 1;
+            background: #3465a4;
+            color: #f2f2f2;
+            border: solid #f2f2f2;
+            width: 1fr;
         }
         #agent-log {
-            background: #000000;
-            color: #00ffff;
-            border: solid #440044;
-            margin-bottom: 1;
+            background: #3465a4;
+            color: #f2f2f2;
+            border: solid #f2f2f2;
+            width: 1fr;
         }
         """
 
@@ -1397,21 +1547,20 @@ def main():
                 id="warning-banner",
                 markup=False
             )
-            # Prompt input field (top-left), with a shell-style "> " marker
-            # preceding it as a visual cue.
+            # Side-by-side panels (Norton-Commander style): Agent output on
+            # the left, Console output on the right, screen split in the middle.
+            agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=2000)
+            agent.border_title = "Agent Output"
+            console = RichLog(id="console-log", auto_scroll=True, wrap=True, max_lines=1000)
+            console.border_title = "Console Output"
+            yield Horizontal(agent, console, id="panels")
+            # Prompt input field (bottom, full width), with a shell-style
+            # "> " marker preceding it as a visual cue.
             yield Horizontal(
                 Static(">", id="prompt-marker", markup=False),
                 Input(id="prompt-input", placeholder="Type a prompt or /command, then Enter"),
                 id="prompt-container",
             )
-            # Console output panel (top-right) - RichLog for streaming command output
-            console = RichLog(id="console-log", auto_scroll=True, wrap=True, max_lines=1000)
-            console.border_title = "Console Output"
-            yield console
-            # Agent output panel (bottom, full width) - RichLog for streaming LLM output
-            agent = RichLog(id="agent-log", auto_scroll=True, wrap=True, max_lines=2000)
-            agent.border_title = "Agent Output"
-            yield agent
             # Status footer
             yield Static(id="status-bar")
 
@@ -1486,14 +1635,14 @@ def main():
                 self._write_agent(f"  Max prompt len: {payload.get('max_prompt_len', 0)}", style="blue")
                 self._write_agent("  [!] Agent starting. Commands will require approval unless /autoapprove is toggled.", style="yellow")
             elif kind == "LOG":
-                self._write_agent(payload.get("text", ""), end=payload.get("end", "\n"))
+                self._write_agent(payload.get("text", ""), end=payload.get("end", "\n"), style=payload.get("style", ""))
             elif kind == "ERROR":
                 self._write_agent(f"[ERROR] {payload.get('text', '')}", style="bold red")
             elif kind == "LLM_STREAM":
                 self._write_agent(payload.get("text", ""), streaming=True, style="cyan")
                 self._track_token()
             elif kind == "THINKING_STREAM":
-                self._write_agent(payload.get("text", ""), streaming=True, prefix="[THINKING] ", style="magenta")
+                self._write_agent(payload.get("text", ""), streaming=True, prefix="[THINKING] ", style="yellow")
                 self._track_token()
             elif kind == "CMD_EXEC":
                 cmd = payload.get("command", "")
@@ -1509,8 +1658,12 @@ def main():
                 cmd = payload.get("command", "")
                 self.pending_approval = {"command": cmd}
                 self._write_console(f"\n[APPROVAL REQUIRED] Command: {cmd}", style="bold yellow")
-                self._write_console(f"  Type /approve to execute, /reject to deny, or /suggest <text> to provide guidance.", style="yellow")
+                self._write_console(f"  Respond to the dialog to approve or reject.", style="yellow")
                 self._refresh_approval_prompt()
+                # Pop up the blocking Y/N modal dialog.  The agent thread is
+                # waiting on the sink's approval event; this dialog captures
+                # the user's decision and resolves it.
+                self._push_approval_dialog(cmd)
             elif kind == "CMD_OUTPUT":
                 text = payload.get("text", "")
                 cmd = payload.get("command", "")
@@ -1657,13 +1810,29 @@ def main():
             except Exception:
                 pass
 
+        def _push_approval_dialog(self, command: str):
+            """Push the blocking Y/N approval modal dialog.
+
+            The agent thread is blocked in TUISink.input() waiting on its
+            approval threading.Event.  This modal captures the user's decision
+            and resolves that event via the on_decision callback, which unblocks
+            the agent.  Uses push_screen so the ModalScreen stacks on top of the
+            main screen and blocks the whole UI until dismissed.
+            """
+            def on_decision(approved: bool):
+                if self.sink:
+                    self.sink.resolve_approval(approved)
+                self.pending_approval = None
+                self._refresh_approval_prompt()
+
+            self.push_screen(ApprovalScreen(command, on_decision))
+
         def _handle_agent_exit(self):
             """Called when the agent thread finishes (normally or via stop)."""
             self.stop_event.set()
             self.agent_thread = None
-            self.agent = None
+            # Keep self.agent so its conversation_history persists across commands.
             self.pending_approval = None
-            self._write_agent("[AGENT EXITED] Cleaning up...")
             # Do not close the app automatically; let user review output.
             self._refresh_approval_prompt()
             self.update_status_bar()
@@ -1694,22 +1863,35 @@ def main():
                 else:
                     self._write_agent("[ERROR] Agent is running but not available for suggestions.")
                 return
-            # Clear the stop event so the new agent run starts fresh.
+            # Clear the stop events so the new agent run starts fresh.
             self.stop_event.clear()
             self.sink = TUISink(self.event_queue, self.stop_event)
             self.sink.auto_approve = self.auto_approve
-            self.agent = LLMInteractor(
-                api_base=self.api_base,
-                model=self.model_name,
-                api_key=self.args.api_key,
-                auto_approve=self.auto_approve,
-                show_thinking=not self.args.no_thinking,
-                command_timeout=self.args.timeout,
-                max_prompt_len=self.args.max_prompt_len,
-                max_output_bytes=self.args.max_output_bytes,
-                debug=self.args.debug,
-                sink=self.sink
-            )
+            if self.agent is None:
+                # First run: create a fresh agent.  persist_history is enabled
+                # so that if the user later sends another command, the same
+                # instance is reused and its conversation history carries over.
+                self.agent = LLMInteractor(
+                    api_base=self.api_base,
+                    model=self.model_name,
+                    api_key=self.args.api_key,
+                    auto_approve=self.auto_approve,
+                    show_thinking=not self.args.no_thinking,
+                    command_timeout=self.args.timeout,
+                    max_prompt_len=self.args.max_prompt_len,
+                    max_output_bytes=self.args.max_output_bytes,
+                    debug=self.args.debug,
+                    sink=self.sink,
+                    persist_history=True
+                )
+            else:
+                # Reuse the existing agent so its conversation history (from
+                # prior commands in this session) is carried into the new run.
+                # Clear its internal stop event so the loop can run again, and
+                # point it at the fresh sink.
+                self.agent.persist_history = True
+                self.agent.stop_event.clear()
+                self.agent.sink = self.sink
             self.agent_thread = threading.Thread(
                 target=self.agent.run_interactor,
                 args=(prompt,),
@@ -1816,9 +1998,13 @@ def main():
                 self._write_agent("[STOP] Stopping agent...")
                 self._stop_agent()
 
+            elif command in ("/quit", "/exit"):
+                self._write_agent("[QUIT] Exiting agent...")
+                self.shutdown()
+
             else:
                 self._write_agent(f"[UNKNOWN COMMAND] {cmd}")
-                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /stop")
+                self._write_agent("Available: /autoapprove /aa /approve /reject /suggest /stop /quit /exit")
 
         # --- Key bindings ---
         def key_press(self, event):
