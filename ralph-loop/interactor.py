@@ -176,6 +176,10 @@ class ConsoleSink(EventSink):
             style = payload.get("style", "")
             if style == "yellow":
                 print(f"{colors.YELLOW}{text}{colors.END}", end=end, flush=flush)
+            elif style == "green":
+                print(f"{colors.GREEN}{text}{colors.END}", end=end, flush=flush)
+            elif style == "red":
+                print(f"{colors.RED}{text}{colors.END}", end=end, flush=flush)
             else:
                 print(text, end=end, flush=flush)
         else:
@@ -940,7 +944,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
                         parsed_args = json.loads(arguments_str)
                     except json.JSONDecodeError as e:
                         parse_error = str(e)
-                        self._log_error(f"[ERROR] Tool call arguments could not be parsed as JSON: {parse_error}")
+                        self._log_error(f"Tool call arguments could not be parsed as JSON: {parse_error}")
 
                 if parse_error is not None:
                     malformed_tool_calls.append({
@@ -1179,7 +1183,7 @@ Think carefully; response quality is the highest priority. You have unlimited th
                                     })
                             except Exception as e:
                                 error_msg = f"Command execution failed: {str(e)}"
-                                self._log_error(f"[ERROR] {error_msg}")
+                                self._log_error(error_msg)
 
                                 if tool_call_id:
                                     self.conversation_history.append({
@@ -1330,6 +1334,75 @@ class ApprovalScreen(ModalScreen):
         self._resolve(False)
 
 
+def enable_sandbox() -> Tuple[bool, str]:
+    """Enable a basic OS-level sandbox on Linux using py-landlock.
+
+    Restricts the agent so it can only WRITE inside the current working
+    directory (and its subdirectories) plus /tmp.  Reads are allowed
+    anywhere, and command execution + network access are preserved.
+
+    Does NOT print anything: the caller is responsible for routing the
+    returned status message through the active sink so it appears in the
+    agent output panel (green when the sandbox is active, red when the
+    agent runs unsandboxed).
+
+    Returns (enabled, message) where ``enabled`` is True if the sandbox
+    was successfully applied and ``message`` is a human-readable [SANDBOX]
+    status line describing what happened.
+    """
+    # 1) OS detection: Landlock is a Linux-only kernel security module.
+    if sys.platform != 'linux':
+        return (False,
+                "[SANDBOX] Not running on Linux; no OS-level sandbox applied")
+
+    # 2) Import py-landlock lazily so --nogui / non-Linux runs don't need it.
+    try:
+        from py_landlock import Landlock, AccessFs
+    except ImportError:
+        return (False,
+                "[SANDBOX] py-landlock not installed; running unsandboxed")
+
+    try:
+        cwd = os.getcwd()
+        # allow_read("/")  -> reads allowed everywhere (any other dir is
+        #                     forbidden to WRITE, not to READ).
+        # allow_execute("/")-> binaries can still be executed.
+        # allow_write(cwd, "/tmp", "/dev", "/dev/pts") -> writes restricted
+        #                     to cwd (recursively covers its subdirectories),
+        #                     /tmp, /dev, and /dev/pts.  /dev is required so
+        #                     the agent can allocate ptys (/dev/ptmx) and use
+        #                     /dev/null when executing commands; /dev/pts is a
+        #                     separate devpts mount holding the dynamically-
+        #                     created pty slave nodes, so it must be allowed
+        #                     explicitly.
+        # allow_all_network() -> preserve outbound HTTP (OpenAI API, curl...).
+        # allow_all_scope()  -> preserve IPC/signal handling (ABI >= 6).
+        # strict=False       -> best-effort: skip rules for missing paths.
+        #
+        # pty handling also issues ioctl() calls on the device files
+        # (TIOCSPTLCK, TIOCGPTN, TIOCSWINSZ, ...).  Those are gated behind the
+        # IOCTL_DEV access right (Landlock ABI v5), which allow_write() does
+        # NOT grant, so add it explicitly for the device paths.  On kernels
+        # with ABI < 5 the flag is silently dropped (strict=False).
+        ll = Landlock(strict=False) \
+            .allow_read("/") \
+            .allow_execute("/") \
+            .allow_write(cwd, "/tmp", "/dev", "/dev/pts") \
+            .allow_all_network() \
+            .allow_all_scope()
+        ll.add_path_rule(
+            "/dev", "/dev/pts", "/dev/tty",
+            access=AccessFs.IOCTL_DEV,
+        )
+        ll.apply()
+        return (True,
+                "[SANDBOX] OS-level Landlock sandbox enabled "
+                "(writes restricted to cwd, /tmp, /dev, and /dev/pts)")
+    except Exception as e:
+        return (False,
+                f"[SANDBOX] Failed to enable Landlock sandbox: {e}")
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Advanced LLM Interactor Tool")
@@ -1350,6 +1423,8 @@ def main():
                         help="Enable debug mode (dump conversation history on truncation)")
     parser.add_argument("--nogui", action="store_true",
                         help="Run in direct CLI mode without TUI (original behaviour)")
+    parser.add_argument("--disable-sandbox", action="store_true",
+                        help="Disable the OS-level Landlock sandbox (Linux only)")
     parser.add_argument("request", nargs="*", help="Task request")
 
     args = parser.parse_args()
@@ -1358,11 +1433,29 @@ def main():
         print("[ERROR] Please provide a task request", file=sys.stderr)
         sys.exit(1)
 
+    # Enable the OS-level sandbox (Linux + py-landlock) unless explicitly
+    # disabled.  This must happen before the agent thread is started so the
+    # Landlock domain covers the whole process (both --nogui and TUI paths).
+    # The [SANDBOX] status message is routed through the active sink later so
+    # it appears in the agent output panel (green when active, red otherwise).
+    if args.disable_sandbox:
+        args.sandbox_enabled = False
+        args.sandbox_msg = "[SANDBOX] Sandbox disabled via --disable-sandbox"
+    else:
+        args.sandbox_enabled, args.sandbox_msg = enable_sandbox()
+
     # Determine sink mode: --nogui uses ConsoleSink (direct CLI, original behaviour).
     # Default (no flag) uses TUISink + Textual app.  The TUI path requires the
     # Textual library to be available.
     if args.nogui:
         sink = ConsoleSink()
+        # Route the [SANDBOX] status through the sink so it appears in the
+        # agent output (green when the OS-level sandbox is active, red when
+        # the agent runs unsandboxed).
+        sink.emit("LOG", {
+            "text": args.sandbox_msg,
+            "style": "green" if args.sandbox_enabled else "red",
+        })
         interactor = LLMInteractor(
             api_base=args.api_base,
             model=args.model,
@@ -1532,6 +1625,10 @@ def main():
             # label like "[THINKING]" is shown once at the start of a stream
             # rather than prepended to every token chunk.
             self._stream_prefix_done: set = set()
+            # Ensure the [SANDBOX] status is shown in the agent output panel
+            # exactly once (green when the OS-level sandbox is active, red
+            # when the agent runs unsandboxed), not on every agent re-run.
+            self._sandbox_notified = False
 
         def compose(self) -> ComposeResult:
             # Warning banner at top
@@ -1867,6 +1964,14 @@ def main():
             self.stop_event.clear()
             self.sink = TUISink(self.event_queue, self.stop_event)
             self.sink.auto_approve = self.auto_approve
+            # Show the [SANDBOX] status in the agent output panel exactly once
+            # (green when the OS-level sandbox is active, red when unsandboxed).
+            if not self._sandbox_notified:
+                self.sink.emit("LOG", {
+                    "text": self.args.sandbox_msg,
+                    "style": "green" if self.args.sandbox_enabled else "red",
+                })
+                self._sandbox_notified = True
             if self.agent is None:
                 # First run: create a fresh agent.  persist_history is enabled
                 # so that if the user later sends another command, the same
